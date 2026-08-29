@@ -162,6 +162,10 @@ def _meta_dir_for(rel_path, scope=None, username=None):
 
 def save_meta(rel_path, original_name, size, scope=None, username=None):
     rel_path = os.path.normpath(rel_path)   # 防御:消除 ../ 等,避免元数据目录错位
+    # normpath('..') 仍为 '..',须再校验:绝对路径或越出 meta_base 的相对路径一律
+    # 拒绝,防止元数据 JSON 写到 meta_base 之外(如 rel_path 来自被污染的调用方)
+    if os.path.isabs(rel_path) or rel_path == '..' or rel_path.startswith('..' + os.sep):
+        raise ValueError(f"非法的元数据相对路径: {rel_path!r}")
     meta_dir = _meta_dir_for(rel_path, scope, username)
     os.makedirs(meta_dir, exist_ok=True)
     meta_file = os.path.join(meta_dir, os.path.basename(rel_path) + '.json')
@@ -176,27 +180,40 @@ def save_meta(rel_path, original_name, size, scope=None, username=None):
 def get_meta_path(rel_path, scope=None):
     return os.path.join(_meta_dir_for(rel_path, scope), os.path.basename(rel_path) + '.json')
 
-def resolve_target_path(src_abs: str, target: str, root: str = None) -> str:
+def resolve_target_path(src_abs: str, target: str, root: str = None, target_base: str = None) -> str:
     """
     将目标路径 target 解析为绝对路径。
     如果 target 是相对路径，则相对于 src_abs 的目录解析；
     如果 target 是绝对路径，则直接使用（但会检查是否在当前盘根内）。
     root 缺省时按 src_abs 前缀自动推断所属盘根(个人盘取 <用户名> 这一层,
     防止 ../ 跨用户)。
+    target_base:可选。跨盘操作时传入目标盘根,此时相对路径(如 '.'/子目录)
+    相对 target_base 解析而非 src 所在目录,越权校验同样按 root 执行;
+    同盘调用不传此参数,行为与原来完全一致。
     """
     if not target:
         raise ValueError("目标路径不能为空")
-    src_dir = os.path.dirname(src_abs)
-    if os.path.isabs(target):
-        target_abs = os.path.abspath(target)
+    if target_base is not None:
+        # 跨盘:相对路径基于目标盘根解析(与同盘"相对源目录"语义区分)
+        if os.path.isabs(target):
+            target_abs = os.path.abspath(target)
+        else:
+            target_abs = os.path.abspath(os.path.join(target_base, target))
     else:
-        target_abs = os.path.abspath(os.path.join(src_dir, target))
+        src_dir = os.path.dirname(src_abs)
+        if os.path.isabs(target):
+            target_abs = os.path.abspath(target)
+        else:
+            target_abs = os.path.abspath(os.path.join(src_dir, target))
 
     if root is None:
         # 按 src_abs 前缀推断盘根
         src_real = os.path.realpath(src_abs)
         priv_real = os.path.realpath(st.PRIVATE_ROOT)
-        if os.path.normcase(src_real).startswith(os.path.normcase(priv_real) + os.sep):
+        # 相等判断:源恰好等于 PRIVATE_ROOT 本身(如操作整个 private 根)也应归个人盘;
+        # 此前仅 startswith(priv_real+sep) 匹配,恰好相等会误判为共享盘
+        if (os.path.normcase(src_real) == os.path.normcase(priv_real)
+                or os.path.normcase(src_real).startswith(os.path.normcase(priv_real) + os.sep)):
             rest = src_real[len(priv_real):].lstrip(os.sep)
             user_part = rest.split(os.sep, 1)[0] if rest else ''
             root = os.path.join(priv_real, user_part) if user_part else priv_real
@@ -224,3 +241,13 @@ def _ensure_distinct_target(src, dst):
     if os.path.isdir(src_real) and os.path.normcase(dst_real).startswith(os.path.normcase(src_real) + os.sep):
         return '目标不能位于源目录内部'
     return None
+
+
+def resolve_cross_dst(src_abs: str, target: str, dst_root: str) -> str:
+    """跨盘(共享盘↔个人盘)移动/复制的目标解析统一入口:
+    - target 为空或 '.' 时,目标 = dst_root/<源名>(把源放进目标盘根);
+    - 否则 target 相对 dst_root 解析(绝对路径则校验在 dst_root 内)。
+    与 resolve_target_path 一样做越权校验,目标盘根外一律拒绝。"""
+    if not target or target in ('.', './'):
+        return os.path.join(dst_root, os.path.basename(os.path.normpath(src_abs)))
+    return resolve_target_path(src_abs, target, root=dst_root, target_base=dst_root)

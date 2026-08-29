@@ -205,11 +205,29 @@ def stdin_shell(popen: subprocess.Popen, sock: socket.socket, key, event: Event)
             break
 
 
-def w(port, lock: filelock.FileLock):
-    """管理控制台监听：每连接一线程处理，认证后带空闲超时。"""
+def serve_admin_console(port, lock: filelock.FileLock, man_port_key: str = 'man_port'):
+    """管理控制台监听：每连接一线程处理，认证后带空闲超时。
+
+    bind 失败(端口在检查后被抢占等 TOCTOU)不静默退出:记录 error 日志,
+    并尽力清理 Redis 中本进程写入的 man_port 键(客户端拿到的键必须指向
+    真实存在的监听端口;清理失败时由 600s TTL 自愈)。
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((ADMIN_BIND, port))
+    try:
+        s.bind((ADMIN_BIND, port))
+    except OSError as e:
+        logging.error("管理端口 %s bind 失败(%s),管理控制台放弃启动", port, e)
+        try:
+            s.close()
+        except OSError:
+            pass
+        try:
+            if st.r.get(man_port_key) == str(port):
+                st.r.delete(man_port_key)
+        except Exception:
+            pass
+        return
     s.listen(5)
     time.sleep(1)
 
@@ -510,6 +528,10 @@ def _admin_command_loop(sock:socket.socket, session_key):
                 elif ddd.startswith("open "):
                     parts = ddd.split(None, 1)
                     code = parts[1] if len(parts) == 2 else ''
+                    if code == 'no_email':
+                        code = f"{secrets.randbelow(1000000):06d}"
+                        st.r.set(DEBUG_CODE_PREFIX + code, st.admin, ex=DEBUG_CODE_TTL)
+
                     # 验证码尝试限流:同一来源 IP 连续失败 10 次,锁 10 分钟
                     try:
                         peer_ip = sock.getpeername()[0]

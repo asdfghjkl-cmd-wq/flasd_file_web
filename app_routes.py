@@ -25,7 +25,7 @@ from app_paths import (safe_path, clean_filename, _reserve_upload_path,
                        _current_root, _root_for_scope, _task_root,
                        _share_path_check, _meta_base_for, _meta_dir_for,
                        save_meta, get_meta_path, resolve_target_path,
-                       _ensure_distinct_target)
+                       resolve_cross_dst, _ensure_distinct_target)
 from app_tools import tool, get_hash, download, zipe, sze
 from app_auth import login_required, is_allowed, is_admin, _client_ip
 
@@ -159,11 +159,52 @@ def webdelete_task(task_id):
 
 # ==================== 移动 / 复制 ====================
 
+def _task_src_dst_roots(task_id):
+    """worker 线程内解析源/目标盘根:
+    源盘根沿用任务记录 root(兼容旧任务);目标盘根取任务记录 dst_root,
+    仅跨盘任务由提交端写入(同盘任务为 None,行为与旧版一致)。"""
+    t = st.get_task(task_id)
+    src_root = (t.get('root') if t else None) or st.UPLOAD_DIR
+    dst_root = t.get('dst_root') if t else None
+    return src_root, dst_root
+
+
+def _resolve_dst_root(dst_scope):
+    """跨盘目标盘根解析(按当前会话用户确定):
+    'shared' → 共享盘根;'personal' → 当前用户个人盘根;缺省/空 → None(同盘)。
+    个人盘根绑定当前登录用户,worker 只读任务记录里已算好的 dst_root,
+    不信任请求中的任意路径,天然防跨用户。非法取值抛 ValueError。"""
+    if not dst_scope:
+        return None
+    if dst_scope == 'shared':
+        return st.UPLOAD_DIR
+    if dst_scope == 'personal':
+        root = _root_for_scope('personal', session.get('user_id'))
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as e:
+            logging.error(f"创建个人盘目标目录失败: {root} ({e})")
+        return root
+    raise ValueError(f"非法目标盘: {dst_scope!r}")
+
+
+def _display_cross_dst(source, target, dst_root):
+    """任务记录 file_info.dst 的展示路径:与 worker 内 resolve_cross_dst 语义一致。"""
+    src = safe_path(source, root=_current_root())
+    if dst_root:
+        return resolve_cross_dst(src, target, dst_root)
+    return resolve_target_path(src, target)
+
+
 def move_file(source, target, task_id, cancel_check):
     try:
-        root = _task_root(task_id)
-        src = safe_path(source, root=root)
-        dst = resolve_target_path(src, target, root=root)
+        src_root, dst_root = _task_src_dst_roots(task_id)
+        src = safe_path(source, root=src_root)
+        if dst_root:
+            # 跨盘(共享盘↔个人盘):目标在目标盘根内解析(空/'.' = 目标盘根+源名)
+            dst = resolve_cross_dst(src, target, dst_root)
+        else:
+            dst = resolve_target_path(src, target, root=src_root)
     except ValueError as e:
         st.save_task(task_id, {'error': str(e)})
         return False
@@ -172,7 +213,8 @@ def move_file(source, target, task_id, cancel_check):
     if overlap:
         st.save_task(task_id, {'error': overlap})
         return False
-    # 同盘且目标不存在的单文件优先原子 rename(瞬间完成);否则回退复制+删除(支持取消)
+    # 同盘且目标不存在的单文件优先原子 rename(瞬间完成);否则回退复制+删除(支持取消)。
+    # 跨盘操作跨文件系统,os.replace 会抛 OSError,自动走复制+删除,无需特判。
     if os.path.isfile(src) and not os.path.exists(dst):
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -204,9 +246,13 @@ def _copy_chunked(src, dst, cancel_check):
 
 def copy_file(source, target, task_id, cancel_check):
     try:
-        root = _task_root(task_id)
-        src = safe_path(source, root=root)
-        dst = resolve_target_path(src, target, root=root)
+        src_root, dst_root = _task_src_dst_roots(task_id)
+        src = safe_path(source, root=src_root)
+        if dst_root:
+            # 跨盘(共享盘↔个人盘):目标在目标盘根内解析(空/'.' = 目标盘根+源名)
+            dst = resolve_cross_dst(src, target, dst_root)
+        else:
+            dst = resolve_target_path(src, target, root=src_root)
     except ValueError as e:
         st.save_task(task_id, {'error': str(e)})
         return False
@@ -1185,7 +1231,11 @@ def call_move():
             abort(400)
         source = data["source"]
         target = data["target"]
-
+        try:
+            # 可选:目标盘 'shared'/'personal',缺省同盘(与原行为一致)
+            dst_root = _resolve_dst_root(data.get("dst_scope"))
+        except ValueError:
+            abort(400)
     except (KeyError, TypeError):
         abort(400)
     func = move_file
@@ -1199,9 +1249,10 @@ def call_move():
         'tool_id': tool_id,
         'progress': {'total': 0, 'current': 0},
 
-        'file_info': {'src': source, 'dst': resolve_target_path(safe_path(source, root=_current_root()), target)},
+        'file_info': {'src': source, 'dst': _display_cross_dst(source, target, dst_root)},
         'owner': session.get('user_id', ''),
         'root': _current_root(),
+        'dst_root': dst_root or '',
         'path': os.path.dirname(os.path.abspath(source))
     })
     arg_list = (source, target)
@@ -1221,7 +1272,11 @@ def call_copy():
             abort(400)
         source = data["source"]
         target = data["target"]
-
+        try:
+            # 可选:目标盘 'shared'/'personal',缺省同盘(与原行为一致)
+            dst_root = _resolve_dst_root(data.get("dst_scope"))
+        except ValueError:
+            abort(400)
     except (KeyError, TypeError):
         abort(400)
     func = copy_file
@@ -1235,9 +1290,10 @@ def call_copy():
         'tool_id': tool_id,
         'progress': {'total': 0, 'current': 0},
 
-        'file_info': {'src': source, 'dst': target},
+        'file_info': {'src': source, 'dst': _display_cross_dst(source, target, dst_root)},
         'owner': session.get('user_id', ''),
         'root': _current_root(),
+        'dst_root': dst_root or '',
         'path': os.path.dirname(os.path.abspath(source))
     })
     arg_list = (source, target)

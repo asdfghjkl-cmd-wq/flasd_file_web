@@ -77,7 +77,7 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
 <div class="container">
 <div class="header"><h1>📁 文件管理</h1><div><span>欢迎, {{ username }} | </span><span id="scopeSwitch"></span><a href="/logout">退出</a></div></div>
 <div class="main">
-<div class="breadcrumb" id="breadcrumb"><a onclick="nav('')">根目录</a></div>
+<div class="breadcrumb" id="breadcrumb"><a href="#" data-csp-action="nav">根目录</a></div>
 
 <div class="upload-area" id="dropArea">
   <h3>拖拽文件到此处或点击下方按钮选择</h3>
@@ -98,7 +98,7 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
   <button class="btn btn-danger" id="clearSelBtn">清空选择</button>
 </div>
 <div class="status" id="statusMsg">
-  <div style="float: right;"><a href="javascript:closestatus()" style="color: rgb(255, 0, 0);"> X</a> </div>
+  <div style="float: right;"><a href="#" data-csp-action="closestatus" style="color: rgb(255, 0, 0);"> X</a> </div>
     <div id="stw"></div>
 </div>
 <!-- 下载任务进度容器 -->
@@ -127,11 +127,20 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
       <option value="5">计算哈希</option>
     </select>
   <br>
-    目标路径: <input type="text" id="file_path" placeholder="目标路径">
+     目标盘:
+     <select id="file_dst_scope">
+       <option value="">当前盘(默认)</option>
+       <option value="shared">共享盘</option>
+       <option value="personal">我的个人盘</option>
+     </select>
+     <br>
+     目标路径: <input type="text" id="file_path" placeholder="目标路径">
+     <br>
+     <span style="font-size:12px;color:#888">路径相对所选盘根;选了"共享盘/个人盘"且留空 = 放进该盘根目录</span>
     <br>
     <div class="modal-actions">
-      <button class="btn" onclick="upok = 2">取消</button>
-      <button class="btn btn-success" onclick="ca()">操作</button>
+      <button class="btn" data-csp-action="upok2">取消</button>
+      <button class="btn btn-success" data-csp-action="ca">操作</button>
     </div>
   </div>
 </div>
@@ -147,14 +156,22 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
       <option value="5">计算哈希</option>
     </select>
   <br>
-    目标路径: <input type="text" id="file_path_2" placeholder="目标路径">
+     目标盘:
+     <select id="file_dst_scope_2">
+       <option value="">当前盘(默认)</option>
+       <option value="shared">共享盘</option>
+       <option value="personal">我的个人盘</option>
+     </select>
+     <br>
+     目标路径: <input type="text" id="file_path_2" placeholder="目标路径">
+     <span style="font-size:12px;color:#888">路径相对所选盘根;选了"共享盘/个人盘"且留空 = 放进该盘根目录</span>
     <div id="passwordt" style="display:none"> 
     密码: <input type="text" id="password" placeholder="密码(如果有的话)" >
     </div>
     <br>
     <div class="modal-actions">
-      <button class="btn" onclick="upok = 2">取消</button>
-      <button class="btn btn-success" onclick="ca2()">操作</button>
+      <button class="btn" data-csp-action="upok2">取消</button>
+      <button class="btn btn-success" data-csp-action="ca2">操作</button>
     </div>
   </div>
 </div>
@@ -165,8 +182,8 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
     <h3>新建文件夹</h3>
     <input type="text" id="folderName" placeholder="文件夹名称">
     <div class="modal-actions">
-      <button class="btn" onclick="document.getElementById('folderModal').style.display='none'">取消</button>
-      <button class="btn btn-success" onclick="createFolder()">创建</button>
+      <button class="btn" data-csp-action="hideFolderModal">取消</button>
+      <button class="btn btn-success" data-csp-action="createFolder">创建</button>
     </div>
   </div>
 </div>
@@ -178,8 +195,8 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
     <input type="text" id="urls" placeholder="地址">
     <br>
     <div class="modal-actions">
-      <button class="btn btn-success" onclick="download()">下载</button>
-      <button class="btn" onclick="document.getElementById('helo').style.display='none'">取消</button>
+      <button class="btn btn-success" data-csp-action="download">下载</button>
+      <button class="btn" data-csp-action="hideHelo">取消</button>
     </div>
   </div>
 </div>
@@ -197,8 +214,8 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
         <br>
         <input type="text" id="args" placeholder="分割: -c 块大小 -f 文件路径;合成: 目录路径">
         <div class="modal-actions">
-          <button class="btn btn-success" onclick="call_tool_a()">调用</button>
-          <button class="btn" onclick="document.getElementById('fuck').style.display='none'">取消</button>
+          <button class="btn btn-success" data-csp-action="call_tool_a">调用</button>
+          <button class="btn" data-csp-action="hideFuck">取消</button>
         </div>
       </div>
   </div>
@@ -211,7 +228,7 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
     <div id="trashList" style="max-height:400px;overflow-y:auto;"></div>
     <div class="modal-actions" style="margin-top:15px;">
       <button class="btn btn-danger" id="clearTrashBtn">清空回收站</button>
-      <button class="btn" onclick="document.getElementById('trashModal').style.display='none'">关闭</button>
+      <button class="btn" data-csp-action="hideTrashModal">关闭</button>
     </div>
   </div>
 </div>
@@ -224,13 +241,57 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
       <p>加载中...</p>
     </div>
     <div class="modal-actions" style="margin-top:15px;">
-      <button class="btn btn-success" onclick="loadTasks()">🔄 刷新</button>
-      <button class="btn" onclick="document.getElementById('taskModal').style.display='none'">关闭</button>
+      <button class="btn btn-success" data-csp-action="loadTasks">🔄 刷新</button>
+      <button class="btn" data-csp-action="hideTaskModal">关闭</button>
     </div>
   </div>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
+// ========== CSP 事件委托 ==========
+// CSP script-src 已收紧为 'self' + nonce(不再放行 'unsafe-inline'),HTML 解析器
+// 遇到的内联 onclick= 属性会被浏览器阻止。因此静态 HTML 与 JS 生成的元素统一改为
+// data-csp-action + 全局 click 委托分发:
+//   - 参数经 encodeURIComponent 写入 data-csp-p1/p2,委托侧 decodeURIComponent 还原
+//     (路径可含引号/&/< 等任意字符,避免拼接 JS 字符串的转义地狱);
+//   - 命中委托的 <a> 统一 preventDefault(面包屑/关闭链接只是行为元素,不该导航);
+//   - switch 各 case 调用的函数都是本 script 内的声明(hoisted),点击时必然已定义。
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-csp-action]');
+  if (!el) return;
+  if (el.tagName === 'A') e.preventDefault();
+  const action = el.getAttribute('data-csp-action');
+  const raw1 = el.getAttribute('data-csp-p1');
+  const p2 = el.getAttribute('data-csp-p2');
+  const p1 = (raw1 === null || raw1 === undefined) ? undefined : decodeURIComponent(raw1);
+  switch (action) {
+    case 'nav': nav(p1 || ''); break;
+    case 'file_call': file_call(p1, p2); break;
+    case 'file2_call': file2_call(p1, p2); break;
+    case 'deleteItem': deleteItem(p1, p2); break;
+    case 'share': share(p1); break;
+    case 'removeSelected': removeSelected(parseInt(p1, 10)); break;
+    case 'cancelDownload': cancelDownload(p1); break;
+    case 'restoreTrash': restoreTrash(p1); break;
+    case 'deleteTrashItem': deleteTrashItem(p1); break;
+    case 'cancelTask': cancelTask(p1); break;
+    case 'deleteTask': deleteTask(p1); break;
+    // 静态模态框按钮(无参数)
+    case 'upok2': upok = 2; break;
+    case 'ca': ca(); break;
+    case 'ca2': ca2(); break;
+    case 'createFolder': createFolder(); break;
+    case 'download': download(); break;
+    case 'call_tool_a': call_tool_a(); break;
+    case 'loadTasks': loadTasks(); break;
+    case 'closestatus': closestatus(); break;
+    case 'hideFolderModal': document.getElementById('folderModal').style.display = 'none'; break;
+    case 'hideHelo': document.getElementById('helo').style.display = 'none'; break;
+    case 'hideFuck': document.getElementById('fuck').style.display = 'none'; break;
+    case 'hideTrashModal': document.getElementById('trashModal').style.display = 'none'; break;
+    case 'hideTaskModal': document.getElementById('taskModal').style.display = 'none'; break;
+  }
+});
 // ========== 全局状态 ==========
 let currentPath = '';
 let selectedFiles = [];
@@ -381,7 +442,7 @@ function updateSelectedList() {
   let html = '<strong>已选文件：</strong><br>';
   selectedFiles.forEach((f, i) => {
     html += `<div class="selected-item"><span>${f.name} (${(f.size/1024).toFixed(1)} KB)</span>
-             <button class="btn btn-danger btn-small" onclick="removeSelected(${i})">移除</button></div>`;
+             <button class="btn btn-danger btn-small" data-csp-action="removeSelected" data-csp-p1="${i}">移除</button></div>`;
   });
   el.innerHTML = html;
 }
@@ -652,10 +713,10 @@ function renderFileList(items) {
       html += `<div class="file-item">
                 <div class="file-icon">📁</div>
                 <div class="file-info">
-                  <span class="folder-name" onclick="nav('${itemPath.replace(/'/g, "\\'")}')">${item.name}</span>
+                  <span class="folder-name" data-csp-action="nav" data-csp-p1="${encodeURIComponent(itemPath)}">${item.name}</span>
                 </div>
-                <button class="btn btn-small" onclick="file_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
-                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'dir')">删除</button>
+                <button class="btn btn-small" data-csp-action="file_call" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="dir">操作</button>
+                <button class="btn btn-danger btn-small" data-csp-action="deleteItem" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="dir">删除</button>
               </div>`;
     } else if (item.type === 'file' && item.type_zip) {
       const size = item.size ? (item.size/1024/1024).toFixed(2) + ' MB' : '未知';
@@ -665,10 +726,10 @@ function renderFileList(items) {
                   <div class="file-name">${item.name}</div>
                   <div class="file-meta">${size} | ${item.modified || ''}</div>
                 </div>
-                <button class="btn btn-outline btn-small" onclick="share('${itemPath.replace(/'/g, "\\'")}')">生成分享链接</button>
-                <button class="btn btn-small" onclick="file2_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
+                <button class="btn btn-outline btn-small" data-csp-action="share" data-csp-p1="${encodeURIComponent(itemPath)}">生成分享链接</button>
+                <button class="btn btn-small" data-csp-action="file2_call" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="dir">操作</button>
                 <a href="${apiUrl('/download/' + encodeURIComponent(itemPath))}" class="btn btn-outline btn-small">下载</a>
-                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'file')">删除</button>
+                <button class="btn btn-danger btn-small" data-csp-action="deleteItem" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="file">删除</button>
               </div>`;
     }else {
       const size = item.size ? (item.size/1024/1024).toFixed(2) + ' MB' : '未知';
@@ -678,10 +739,10 @@ function renderFileList(items) {
                   <div class="file-name">${item.name}</div>
                   <div class="file-meta">${size} | ${item.modified || ''}</div>
                 </div>
-                <button class="btn btn-outline btn-small" onclick="share('${itemPath.replace(/'/g, "\\'")}')">生成分享链接</button>
-                <button class="btn btn-small" onclick="file_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
+                <button class="btn btn-outline btn-small" data-csp-action="share" data-csp-p1="${encodeURIComponent(itemPath)}">生成分享链接</button>
+                <button class="btn btn-small" data-csp-action="file_call" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="dir">操作</button>
                 <a href="${apiUrl('/download/' + encodeURIComponent(itemPath))}" class="btn btn-outline btn-small">下载</a>
-                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'file')">删除</button>
+                <button class="btn btn-danger btn-small" data-csp-action="deleteItem" data-csp-p1="${encodeURIComponent(itemPath)}" data-csp-p2="file">删除</button>
               </div>`;
     }
   });
@@ -695,13 +756,13 @@ function nav(path) {
 
 function updateBreadcrumb() {
   const el = document.getElementById('breadcrumb');
-  let html = '<a onclick="nav(\'\')">根目录</a>';
+  let html = '<a href="#" data-csp-action="nav">根目录</a>';
   if (currentPath) {
     const parts = currentPath.split('/');
     let cum = '';
     parts.forEach(p => {
       cum += (cum ? '/' : '') + p;
-      html += ` / <a onclick="nav('${cum.replace(/'/g, "\\'")}')">${p}</a>`;
+      html += ` / <a href="#" data-csp-action="nav" data-csp-p1="${encodeURIComponent(cum)}">${p}</a>`;
     });
   }
   el.innerHTML = html;
@@ -824,7 +885,7 @@ function createDownloadProgress(taskId) {
   div.className = 'task-progress-item';
   div.id = `task-${taskId}`;
   div.innerHTML = `
-    <div><strong>下载中...</strong> <button class="btn btn-danger btn-small" onclick="cancelDownload('${taskId}')">取消</button></div>
+    <div><strong>下载中...</strong> <button class="btn btn-danger btn-small" data-csp-action="cancelDownload" data-csp-p1="${encodeURIComponent(taskId)}">取消</button></div>
     <div class="progress-bar"><div class="progress-inner" style="width:0%"></div></div>
     <div class="progress-text">0 B / 0 B</div>
     <div class="status-text" style="font-size:13px;color:#666;"></div>
@@ -1093,13 +1154,14 @@ async function zipjy(path) {
 
 // ========== 移动、复制（异步任务） ==========
 async function moveItem(Path) {
+  const dstScope = document.getElementById('file_dst_scope').value;
   const targetPath = document.getElementById('file_path').value.trim();
-  if (!targetPath) { alert('请输入目标路径'); return; }
+  if (!targetPath && !dstScope) { alert('请输入目标路径,或选择目标盘(留空=目标盘根目录)'); return; }
   try {
     const resp = await csrfFetch('/file/move', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ source: Path, target: targetPath })
+      body: JSON.stringify({ source: Path, target: targetPath, dst_scope: dstScope })
     });
     if (resp.status === 401) { showStatus('登录已过期','error'); return; }
     let success = true;
@@ -1138,13 +1200,14 @@ async function moveItem(Path) {
 }
 
 async function moveItem2(Path) {
+  const dstScope = document.getElementById('file_dst_scope_2').value;
   const targetPath = document.getElementById('file_path_2').value.trim();
-  if (!targetPath) { alert('请输入目标路径'); return; }
+  if (!targetPath && !dstScope) { alert('请输入目标路径,或选择目标盘(留空=目标盘根目录)'); return; }
   try {
     const resp = await csrfFetch('/file/move', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ source: Path, target: targetPath })
+      body: JSON.stringify({ source: Path, target: targetPath, dst_scope: dstScope })
     });
     if (resp.status === 401) { showStatus('登录已过期','error'); return; }
     let success = true;
@@ -1183,13 +1246,14 @@ async function moveItem2(Path) {
 }
 
 async function copyItem(Path) {
+  const dstScope = document.getElementById('file_dst_scope').value;
   const targetPath = document.getElementById('file_path').value.trim();
-  if (!targetPath) { alert('请输入目标路径'); return; }
+  if (!targetPath && !dstScope) { alert('请输入目标路径,或选择目标盘(留空=目标盘根目录)'); return; }
   try {
     const resp = await csrfFetch('/file/copy', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ source: Path, target: targetPath })
+      body: JSON.stringify({ source: Path, target: targetPath, dst_scope: dstScope })
     });
     if (resp.status === 401) { showStatus('登录已过期','error'); return; }
     let success = true;
@@ -1228,13 +1292,14 @@ async function copyItem(Path) {
 }
 
 async function copyItem2(Path) {
+  const dstScope = document.getElementById('file_dst_scope_2').value;
   const targetPath = document.getElementById('file_path_2').value.trim();
-  if (!targetPath) { alert('请输入目标路径'); return; }
+  if (!targetPath && !dstScope) { alert('请输入目标路径,或选择目标盘(留空=目标盘根目录)'); return; }
   try {
     const resp = await csrfFetch('/file/copy', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ source: Path, target: targetPath })
+      body: JSON.stringify({ source: Path, target: targetPath, dst_scope: dstScope })
     });
     if (resp.status === 401) { showStatus('登录已过期','error'); return; }
     let success = true;
@@ -1300,8 +1365,8 @@ async function loadTrash() {
           <div class="meta">原始路径：${item.original_path} | 删除于 ${time}</div>
         </div>
         <div>
-          <button class="btn btn-success btn-small" onclick="restoreTrash('${item.id}')">恢复</button>
-          <button class="btn btn-danger btn-small" onclick="deleteTrashItem('${item.id}')">彻底删除</button>
+          <button class="btn btn-success btn-small" data-csp-action="restoreTrash" data-csp-p1="${encodeURIComponent(item.id)}">恢复</button>
+          <button class="btn btn-danger btn-small" data-csp-action="deleteTrashItem" data-csp-p1="${encodeURIComponent(item.id)}">彻底删除</button>
         </div>
       </div>
     `;
@@ -1395,9 +1460,9 @@ async function loadTasks() {
       // 操作按钮
       html += `<div class="task-actions">`;
       if (status === 'running' || status === 'pending') {
-        html += `<button class="btn btn-danger btn-small" onclick="cancelTask('${tid}')">取消</button>`;
+        html += `<button class="btn btn-danger btn-small" data-csp-action="cancelTask" data-csp-p1="${encodeURIComponent(tid)}">取消</button>`;
       } else {
-        html += `<button class="btn btn-small" onclick="deleteTask('${tid}')">删除</button>`;
+        html += `<button class="btn btn-small" data-csp-action="deleteTask" data-csp-p1="${encodeURIComponent(tid)}">删除</button>`;
       }
       html += `</div></div>`;
     }

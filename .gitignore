@@ -18,3 +18,4 @@ n.py
 app.py
 .tus_tmp/
 .venv
+.known_hosts

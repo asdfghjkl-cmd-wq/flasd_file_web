@@ -23,6 +23,11 @@ import pyzipper
 from py7zr import SevenZipFile
 from py7zr.callbacks import ExtractCallback
 
+# 模块级日志器:import 期打点(如 DOWNLOAD_VERIFY_TLS 告警)必须用实例 logger,
+# 不能用 logging.warning 等模块级函数——root 尚无 handler 时它们会自动 basicConfig()
+# 添加默认 StreamHandler,与 app.py setup_logging 配置的 handler 重复输出。
+_log = logging.getLogger(__name__)
+
 # 禁用不安全的请求警告（针对 verify=False）
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -408,8 +413,8 @@ def _check_url_host(url):
 # 生产建议:确认内网环境可校验后显式设置 DOWNLOAD_VERIFY_TLS=1,并只信任受控 DNS。
 DOWNLOAD_VERIFY_TLS = os.environ.get('DOWNLOAD_VERIFY_TLS', '0') == '1'
 if not DOWNLOAD_VERIFY_TLS:
-    logging.warning("DOWNLOAD_VERIFY_TLS 未开启:https 下载不做证书校验,存在中间人风险;"
-                    "请确认网络环境后显式设置(生产建议 DOWNLOAD_VERIFY_TLS=1)")
+    _log.warning("DOWNLOAD_VERIFY_TLS 未开启:https 下载不做证书校验,存在中间人风险;"
+                 "请确认网络环境后显式设置(生产建议 DOWNLOAD_VERIFY_TLS=1)")
 DOWNLOAD_MAX_REDIRECTS = 5
 
 def _pin_host(url):

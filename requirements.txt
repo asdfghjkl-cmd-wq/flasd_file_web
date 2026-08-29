@@ -1,3 +1,5 @@
+# Python 要求:>=3.10(代码使用 dict | None、list[str] 等 3.10+ 语法)
+
 # Web 框架
 flask>=3.0
 flask-cors>=4.0
@@ -20,5 +22,8 @@ requests>=2.31
 # 加密(管理控制台 RSA/AES)
 pycryptodome>=3.19
 
-# 生产部署(可选)
+# 生产部署(可选;注意:应用含模块级 Redis 连接/后台线程,请勿配合 gunicorn --preload)
 gunicorn>=21.2
+
+# 测试(可选,运行 tests/ 需要)
+pytest>=8.0

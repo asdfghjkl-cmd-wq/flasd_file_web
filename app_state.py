@@ -27,7 +27,7 @@ from werkzeug.security import generate_password_hash
 from flask import jsonify, session
 
 
-def _env_int(name, default):
+def env_int(name, default):
     """读取整数型环境变量,非法值回退默认值(避免配置写错导致进程起不来)。"""
     raw = os.environ.get(name)
     if raw is None or raw.strip() == '':
@@ -39,6 +39,10 @@ def _env_int(name, default):
         return default
 
 
+# 兼容别名:历史模块(app_admin/app_routes 等)仍用旧下划线名,新代码请用 env_int
+_env_int = env_int
+
+
 # ==================== Redis 连接 ====================
 # 从环境变量读取 Redis 地址，方便部署
 REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
@@ -48,12 +52,30 @@ REDIS_PASSWORD = os.environ.get('REDIS_PASSWORD', None)
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD,
                 decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
-try:
-    logging.info(f"Redis 版本: {r.info('server')['redis_version']}")
-except Exception as e:
-    print(f"[FATAL] Redis 连接失败: {e}", flush=True)
-    logging.error(f"Redis 连接失败: {e}")
-    raise SystemExit(f"Redis 连接失败: {e}")
+# Redis 启动检查:默认 fail-fast(部署早期就发现问题);
+# 测试/无 Redis 环境可设 REDIS_SKIP_CHECK=1 跳过(连接对象惰性,不实际连接)。
+if os.environ.get('REDIS_SKIP_CHECK', '0') != '1':
+    try:
+        logging.info(f"Redis 版本: {r.info('server')['redis_version']}")
+    except Exception as e:
+        print(f"[FATAL] Redis 连接失败: {e}", flush=True)
+        logging.error(f"Redis 连接失败: {e}")
+        raise SystemExit(f"Redis 连接失败: {e}")
+
+# 健康检查专用连接:短超时(1s),避免 Redis 故障时模块级连接 socket_timeout(5s)
+# 拖慢 /healthz /readyz,导致 LB/K8s 探针窗口(通常 1~3s)内误判失败。
+_probe_redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                           password=REDIS_PASSWORD, decode_responses=True,
+                           socket_connect_timeout=1, socket_timeout=1)
+
+
+def ping_redis() -> bool:
+    """探针用 ping:短超时连接,失败仅返回 False(不抛异常,便于探针快速响应)。"""
+    try:
+        _probe_redis.ping()
+        return True
+    except Exception:
+        return False
 # 加固:Redis 存有密码哈希/任务/管理端口等敏感数据
 # 公网无密码默认拒绝启动;确需这样部署时显式设置 ALLOW_INSECURE_REDIS=1
 try:
@@ -95,6 +117,10 @@ os.makedirs(META_DIR, exist_ok=True)
 PRIVATE_ROOT = os.path.join(BASE_DIR, 'private')
 os.makedirs(PRIVATE_ROOT, exist_ok=True)
 PERSONAL_URL_PREFIX = '/p'          # 个人盘 URL 前缀
+# 双空间 scope 标记:WSGI 中间件写入 environ['dsh.scope'],路由经 g.scope 读取;
+# 具名常量避免魔法字符串拼写错误(值不变,兼容 app_routes 中的字面量比较与持久化 meta)
+SCOPE_SHARED = 'shared'
+SCOPE_PERSONAL = 'personal'
 RESERVED_NAMES = {'metadata', 'chunks'}   # 系统保留目录/文件名
 # 用户名规范:仅字母/数字/_/-,1~32 位(个人盘目录依此命名,防跨用户目录冲突)
 USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
@@ -118,6 +144,26 @@ RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 SITE_URL = os.environ.get('SITE_URL', 'https://www.relink.website')
 RESET_TOKEN_TTL = 1800        # 重置链接 30 分钟有效
 RESET_TOKEN_PREFIX = 'reset_token:'
+
+# ==================== 可信反向代理 ====================
+# 可信代理白名单(直连方 IP,逗号分隔):仅在直连方属于本集合时才采纳
+# X-Forwarded-For/Proto/Host 头(app_auth._client_ip 与 app.py 的 ProxyFix
+# 剥头中间件共用,定义收敛在本处避免两份语义漂移)。
+TRUSTED_PROXIES = frozenset(
+    p.strip() for p in os.environ.get('TRUSTED_PROXIES', '').split(',') if p.strip()
+)
+
+
+def is_api_request(request) -> bool:
+    """统一 API 判定(错误处理/安全头/认证共享):JSON 请求、XHR 或 /api/ 路径。
+
+    原来 app.py 仅按 path 前缀判断、app_auth 额外看 is_json/X-Requested-With,
+    两套并存会导致同一请求在错误处理与认证处返回不同响应格式;统一后
+    JSON/XHR 请求一律按 API 语义处理(JSON 错误体),页面请求返回文本。
+    """
+    return (request.is_json or
+            request.headers.get('X-Requested-With') == 'XMLHttpRequest' or
+            request.path.startswith('/api/'))
 
 # ==================== 用户数据存取 ====================
 
@@ -197,7 +243,14 @@ user_emails = {}
 def load_redis():
     """后台同步线程:每 10s 用 Redis 最新快照刷新内存状态。
     容器(users 等)在锁内原地更新,保证共享引用始终有效且不与写路径冲突;
-    admin 为标量,经 st.admin 读取的模块总能拿到最新值。"""
+    admin 为标量,经 st.admin 读取的模块总能拿到最新值。
+
+    多 worker 部署注意:每个 worker 进程持有自己的内存副本,本进程内的修改
+    (save_user 等)实时写 Redis 并同步自己的内存;其它 worker 最长延迟一个
+    同步周期(默认 10s,见下方 time.sleep)才能看到变更——即"删除用户/改密/
+    封禁"后,打到未同步 worker 的旧会话在最坏 10s 内仍可通过 login_required
+    校验。单 worker 部署无此窗口;多 worker 部署若要求更严格,请缩短同步间隔
+    或把登录/权限热路径改为 Redis 直查。"""
     global admin
     while True:
         time.sleep(10)
