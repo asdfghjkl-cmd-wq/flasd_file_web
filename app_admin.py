@@ -4,7 +4,8 @@
 
 - 只监听 ADMIN_BIND(默认 127.0.0.1),认证失败按源 IP 锁定;
 - update/download 传输端口带一次性 token 认证;
-- 全局可变状态一律经 app_state(st.xxx)访问;app.debug 在函数内延迟导入。
+- 全局可变状态一律经 app_state(st.xxx)访问;app/load_html 引用经
+  st.get_app()/st.get_load_html() 注册表获取(替代旧的 sys.modules 别名 hack)。
 """
 import os
 import re
@@ -116,6 +117,9 @@ def _admin_conn_throttle(ip):
 def _pick_transfer_port():
     """挑选空闲端口并生成一次性传输 token。
     注:选端口与 bind 之间存在 TOCTOU,但传输端口有 token 认证兜底。"""
+    if ADMIN_PORT_MAX < ADMIN_PORT_MIN:
+        # env 配错时 randbelow 抛 ValueError 且信息晦涩,显式拒绝并给出清晰错误
+        raise RuntimeError(f"ADMIN_PORT_MAX({ADMIN_PORT_MAX}) < ADMIN_PORT_MIN({ADMIN_PORT_MIN}),请检查环境变量")
     while True:
         sm = secrets.randbelow(ADMIN_PORT_MAX - ADMIN_PORT_MIN + 1) + ADMIN_PORT_MIN
         if not is_port_in_use(sm):
@@ -347,9 +351,9 @@ def _handle_admin_conn_inner(sock, client_addr):
         logging.debug(f"管理连接关闭 {client_addr}")
 
 
-def _admin_command_loop(sock, session_key):
+def _admin_command_loop(sock:socket.socket, session_key):
     """已认证连接的命令循环（每连接一个线程内运行）。"""
-    from app import app   # 延迟导入:命令执行时 app 必然已创建,避免模块循环
+    app = st.get_app()   # 经 app_state 注册表取运行实例(替代 sys.modules hack,见 app_state.py)
     process = None
     while True:
         try:
@@ -360,7 +364,7 @@ def _admin_command_loop(sock, session_key):
             if encrypted_cmd is None:
                 break
             cmd = encrypted_cmd.decode()
-
+            
             try:
                 logging.info(f"exec: {cmd.split(' ')[0:2]} from {sock.getpeername()}")
             except OSError:
@@ -477,7 +481,10 @@ def _admin_command_loop(sock, session_key):
                             break
                         send_plain(sock, t.decode('utf-8', 'replace'), session_key)
             elif cmd == "load":
-                from app import load_html
+                load_html = st.get_load_html()   # 经注册表获取,避免二次加载 app.py(见 app_state.py)
+                if load_html is None:
+                    send_plain(sock, "load_html not registered", session_key)
+                    continue
                 load_html()
                 send_plain(sock, "load ok", session_key)
             elif cmd.lower().startswith('debug '):

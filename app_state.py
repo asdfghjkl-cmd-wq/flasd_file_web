@@ -468,3 +468,36 @@ for _ in range(MAX_WORKERS):
 users, user_list, blocked_users, admin, user_emails = load_user()
 annn = Thread(target=load_redis, daemon=True)
 annn.start()
+
+
+# ==================== app 引用注册表 ====================
+# 替代 app.py 旧有的 sys.modules['app'] hack:python app.py 直跑时本模块名为
+# __main__,app_admin 若延迟 `from app import app` 会把本文件以 'app' 名字再加载
+# 一遍,产生第二个模块对象(日志/密钥/模板等模块级代码重复执行,且拿到与运行
+# 实例不同的第二个 Flask app)。改为:app.py 在模块级创建实例后写入本注册表,
+# app_admin 等需要延迟取引用的地方经 get_app()/get_load_html() 获取,与运行
+# 实例恒为同一对象,且不再依赖"app.py 是第一个被加载的文件"。
+_app_ref = None
+_load_html_ref = None
+
+
+def set_app(app):
+    """注册运行中的 Flask 实例引用(由 app.py 模块级创建后写入)。"""
+    global _app_ref
+    _app_ref = app
+
+
+def get_app():
+    """取运行中的 Flask 实例引用;尚未创建时返回 None。"""
+    return _app_ref
+
+
+def set_load_html(fn):
+    """注册 load_html 函数引用(模板热重载用,见 app_admin 'load' 命令)。"""
+    global _load_html_ref
+    _load_html_ref = fn
+
+
+def get_load_html():
+    """取 load_html 函数引用;尚未注册时返回 None。"""
+    return _load_html_ref
