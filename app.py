@@ -41,8 +41,9 @@ from py7zr.callbacks import ExtractCallback
 
 import zipfile, requests,pyzipper
 import shlex
-from threading import Thread,Event,RLock
+from threading import Thread, Event, RLock, BoundedSemaphore
 from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin
 import logging
 from logging.handlers import RotatingFileHandler
@@ -50,11 +51,10 @@ import select
 import socket
 import struct
 from string import ascii_lowercase, ascii_letters
-from flask import (Flask, request, jsonify, render_template_string,
+from flask import (Flask, request, jsonify, render_template,
                    make_response, send_from_directory, session, redirect, url_for, abort, g)
-import random
 from flask_cors import CORS
-import os, sys, json, traceback, shutil, re, uuid, time, io, secrets
+import os, sys, json, traceback, shutil, re, uuid, time, io, secrets, base64
 from datetime import datetime
 from urllib.parse import quote
 from pathlib import Path
@@ -77,7 +77,7 @@ def _env_int(name, default):
     try:
         return int(raw)
     except (TypeError, ValueError):
-        print(f"[WARN] 环境变量 {name} 不是合法整数({raw!r}),使用默认值 {default}", flush=True)
+        logging.warning(f"环境变量 {name} 不是合法整数({raw!r}),使用默认值 {default}")
         return default
 
 # 从环境变量读取 Redis 地址，方便部署
@@ -89,9 +89,10 @@ REDIS_PASSWORD  = os.environ.get('REDIS_PASSWORD', None)
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD,
                 decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
 try:
-    print(r.info('server')['redis_version'],flush=True)
+    logging.info(f"Redis 版本: {r.info('server')['redis_version']}")
 except Exception as e:
     print(f"[FATAL] Redis 连接失败: {e}", flush=True)
+    logging.error(f"Redis 连接失败: {e}")
     raise SystemExit(f"Redis 连接失败: {e}")
 # 加固:Redis 存有密码哈希/任务/管理端口等敏感数据
 # 公网无密码默认拒绝启动;确需这样部署时显式设置 ALLOW_INSECURE_REDIS=1
@@ -147,20 +148,34 @@ class tool:
             os.makedirs(output_dir)
 
             file_count = 0
-            with open(source_path, "rb") as src:
-                while True:
-                    if cancel_check():
-                        shutil.rmtree(output_dir)
-                        raise Cancelled("cancel")
-                    data = src.read(chunk_size)
-                    if not data:
-                        break
-                    file_count += 1
-
-                    # 4位编号便于排序
-                    out_name = os.path.join(output_dir, f"{file_count:04d}.data")
-                    with  open(out_name, "wb") as chunk:
-                        chunk.write(data)
+            out = None
+            try:
+                with open(source_path, "rb") as src:
+                    while True:
+                        if cancel_check():
+                            raise Cancelled("cancel")
+                        # 每个输出文件累计写满 chunk_size;分块读写,避免整块进内存
+                        if out is None:
+                            file_count += 1
+                            out_name = os.path.join(output_dir, f"{file_count:04d}.data")
+                            out = open(out_name, "wb")
+                            written = 0
+                        data = src.read(min(chunk_size - written, 1024 * 1024))
+                        if not data:
+                            break
+                        out.write(data)
+                        written += len(data)
+                        if written >= chunk_size:
+                            out.close()
+                            out = None
+            except Cancelled:
+                if out is not None:
+                    out.close()
+                shutil.rmtree(output_dir)
+                raise
+            finally:
+                if out is not None:
+                    out.close()
 
     # 写入元信息
             meta_path = os.path.join(output_dir, "file")
@@ -182,7 +197,12 @@ class tool:
                         os.remove(bn.name)
                         raise Cancelled("cancel")
                     with open(os.path.join(dir,f"{nb:04d}.data"),"rb") as an:
-                        bn.write(an.read())
+                        # 分块拷贝,避免整块(最大64MB)读入内存
+                        while True:
+                            chunk = an.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            bn.write(chunk)
             return True
 
 # ==================== 异步任务系统 ====================
@@ -210,7 +230,7 @@ def save_user():
             r.sadd("blocked_users", *blocked_users)
         # 存储管理员
         r.set("admin", admin) # type: ignore
-    print('save ok', flush=True)
+    logging.debug('save ok')
 
 def load_user():
     """从 Redis 加载用户数据(内部持有 _user_lock)"""
@@ -313,8 +333,10 @@ def worker():
                 r.hset(task_key(task_id), 'error', str(e))
         finally:
             if is_cancelled(task_id):
-                r.hset(task_key(task_id), 'status', 'cancelled')
-                r.hset(task_key(task_id), 'error', 'User cancelled')
+                # 只在任务未完成时覆盖为 cancelled,避免与正常完成瞬间的竞态
+                if r.hget(task_key(task_id), 'status') in ('running', 'pending'):
+                    r.hset(task_key(task_id), 'status', 'cancelled')
+                    r.hset(task_key(task_id), 'error', 'User cancelled')
             task_queue.task_done()
 
 for _ in range(MAX_WORKERS):
@@ -341,7 +363,7 @@ if not os.path.exists(TRASH_DIR):
 try:
     with open(os.path.join(BASE_DIR, "s.key"), "r", encoding="utf-8") as s:
         k = s.read()
-except:
+except (OSError, UnicodeDecodeError):
     k = ran_str(128, ascii_letters)
     with open(os.path.join(BASE_DIR, "s.key"), "w", encoding="utf-8") as s:
         s.write(k)
@@ -448,18 +470,37 @@ PRIVATE_ROOT = os.path.join(BASE_DIR, 'private')
 os.makedirs(PRIVATE_ROOT, exist_ok=True)
 PERSONAL_URL_PREFIX = '/p'          # 个人盘 URL 前缀
 RESERVED_NAMES = {'metadata', 'chunks'}   # 系统保留目录/文件名
+# 用户名规范:仅字母/数字/_/-,1~32 位(个人盘目录依此命名,防跨用户目录冲突)
+USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
 # 下载大小上限(字节),防止下载把磁盘写满;0 表示不限制
 DOWNLOAD_MAX_SIZE = _env_int('DOWNLOAD_MAX_SIZE', 10 * 1024**3)
+# 分享链接有效期(秒)
+SHARE_TTL = 86400
+# 分享链接下载限流:同一 IP 每分钟最多次数
+SHARE_RATE_LIMIT = 60
+# 回收站保留时间(秒,与 trash:<id> 的 Redis TTL 一致)
+TRASH_TTL = 86400 * 10
+# 登录/找回限流:同一 IP 每窗口最多失败次数;账号维度阈值放宽防误锁
+LOGIN_FAIL_LIMIT = 5
+LOGIN_FAIL_ACCT_LIMIT = 20
+LOGIN_FAIL_WINDOW = 600
+# 管理控制台:认证失败锁定阈值与时长、空闲超时、握手超时
+ADMIN_AUTH_FAIL_LIMIT = 5
+ADMIN_AUTH_LOCKOUT = 3600
+ADMIN_IDLE_TIMEOUT = 300
+ADMIN_HANDSHAKE_TIMEOUT = 30
 # 管理端口随机范围
 ADMIN_PORT_MIN = _env_int('ADMIN_PORT_MIN', 6000)
 ADMIN_PORT_MAX = _env_int('ADMIN_PORT_MAX', 6050)
 # 管理端口绑定地址(默认仅本机回环;需要远程管理时显式设置 ADMIN_BIND,并配合防火墙/ACL)
-ADMIN_BIND = os.environ.get('ADMIN_BIND', '0.0.0.0')
+ADMIN_BIND = os.environ.get('ADMIN_BIND', '127.0.0.1')
 if ADMIN_BIND not in ('127.0.0.1', '::1', 'localhost'):
     logging.warning(f"ADMIN_BIND={ADMIN_BIND} 非回环地址,管理控制台暴露于网络,请确认防火墙/ACL")
 # 管理控制台握手限流:同一 IP 每窗口最多连接次数
 ADMIN_CONN_LIMIT = _env_int('ADMIN_CONN_LIMIT', 5)
 ADMIN_CONN_WINDOW = 10   # 秒
+# 管理传输连接(update/download)认证后的空闲超时:防对端认证后挂死不释放线程
+TRANSFER_IDLE_TIMEOUT = _env_int('TRANSFER_IDLE_TIMEOUT', 600)
 
 
 # 任务数据用 Hash 存储，键为 task:<task_id>
@@ -481,6 +522,11 @@ def save_task(task_id, data):
     r.hset(key, mapping=safe)
     # 任务 7 天无更新自动过期，防止无限累积
     r.expire(key, 7 * 24 * 3600)
+    # 按归属建立索引,供任务列表/排队限流快速查询(索引 TTL 略长于任务)
+    owner = data.get('owner')
+    if owner:
+        r.sadd(f'user_tasks:{owner}', task_id)
+        r.expire(f'user_tasks:{owner}', 8 * 24 * 3600)
 
 def get_tasks_bulk(tids):
     """批量读取任务（pipeline 化，避免 N+1）；返回 {tid: 反序列化后的 dict}"""
@@ -504,7 +550,10 @@ def get_tasks_bulk(tids):
                 raw['file_info'] = json.loads(raw['file_info'])
             except Exception:
                 pass
-        raw['cancel_flag'] = int(raw.get('cancel_flag', 0))
+        try:
+            raw['cancel_flag'] = int(raw.get('cancel_flag', 0))
+        except (TypeError, ValueError):
+            raw['cancel_flag'] = 0
         out[tid] = raw
     return out
 
@@ -513,7 +562,31 @@ def get_task(task_id):
     return get_tasks_bulk([task_id]).get(task_id)
 
 def delete_task(task_id):
+    t = get_task(task_id)
+    if t and t.get('owner'):
+        r.srem(f'user_tasks:{t["owner"]}', task_id)
     r.delete(task_key(task_id))
+
+
+def _all_task_ids():
+    """返回全部任务 id(scan_iter + bytes 解码)。"""
+    tids = []
+    for key in r.scan_iter(match=f"{TASK_PREFIX}*"):
+        if isinstance(key, bytes):
+            tids.append(key.decode().split(':', 1)[-1])
+        else:
+            tids.append(key.split(':', 1)[-1])
+    return tids
+
+
+def _task_ids_for_view(is_owner_view):
+    """任务 id 集合:普通用户走 user_tasks 索引(为空时回退全量),管理员全量。"""
+    if is_owner_view:
+        tids = list(r.smembers(f'user_tasks:{session.get("user_id")}'))
+        if not tids:
+            return _all_task_ids()
+        return tids
+    return _all_task_ids()
 
 def is_cancelled(task_id):
     """任务执行中检查是否被取消"""
@@ -537,9 +610,11 @@ def _check_pending_limit():
     user = session.get('user_id')
     if not user or user == admin:
         return None
+    # 优先走按用户索引;索引为空(旧数据)时回退全量扫描
+    tids = list(r.smembers(f'user_tasks:{user}')) or _all_task_ids()
     count = 0
-    for key in r.scan_iter(match=f"{TASK_PREFIX}*"):
-        if r.hget(key, 'owner') == user and r.hget(key, 'status') == 'pending':
+    for tid in tids:
+        if r.hget(task_key(tid), 'status') == 'pending':
             count += 1
             if count >= MAX_PENDING_PER_USER:
                 return jsonify({'success': False, 'error': f'排队任务过多(上限 {MAX_PENDING_PER_USER} 个)'}), 429
@@ -577,21 +652,31 @@ def load_redis():
             # Redis 瞬时错误不能让同步线程死掉，记录后下轮重试
             logging.warning(f"load_redis 同步失败: {e}")
 
+# 进度更新 Lua 脚本:在 Redis 内原子完成"读-改-写",并发更新不互相覆盖;
+# total/current 传空串表示不更新该字段;同时续期(与 7 天 TTL 一致)
+_PROGRESS_UPDATE_LUA = """
+local key = KEYS[1]
+local total = ARGV[1]
+local current = ARGV[2]
+local raw = redis.call('HGET', key, 'progress')
+local t = {}
+if raw then
+    local ok, dec = pcall(cjson.decode, raw)
+    if ok and type(dec) == 'table' then t = dec end
+end
+if total ~= '' then t['total'] = tonumber(total) end
+if current ~= '' then t['current'] = tonumber(current) end
+redis.call('HSET', key, 'progress', cjson.encode(t))
+redis.call('EXPIRE', key, 7 * 24 * 3600)
+return 1
+"""
+
 def update_task_progress(task_id, total=None, current=None):
-    """更新任务进度（下载等场景）"""
-    key = task_key(task_id)
-    progress_str = r.hget(key, 'progress')
-    if progress_str:
-        progress = json.loads(progress_str)
-    else:
-        progress = {'total': 0, 'current': 0}
-    if total is not None:
-        progress['total'] = total
-    if current is not None:
-        progress['current'] = current
-    r.hset(key, 'progress', json.dumps(progress))
-    # 长耗时任务(下载)运行期间持续续期,防止 7 天 TTL 中途过期
-    r.expire(key, 7 * 24 * 3600)
+    """更新任务进度（下载等场景）:原子 Lua 更新,避免多线程 RMW 互相覆盖;
+    长耗时任务(下载)运行期间持续续期,防止 7 天 TTL 中途过期。"""
+    r.eval(_PROGRESS_UPDATE_LUA, 1, task_key(task_id),
+           '' if total is None else str(total),
+           '' if current is None else str(current))
 
 users,user_list,blocked_users,admin,user_emails = load_user()
 annn = Thread(target=load_redis,daemon=True)
@@ -617,7 +702,7 @@ def load_html():
         with open(HTML_FILE, "r", encoding="utf-8") as f:
             HTML_TEMPLATE = f.read()
     except Exception as e:
-        print(f"[WARN] 无法加载模板 {HTML_FILE}: {e}")
+        logging.warning(f"无法加载模板 {HTML_FILE}: {e}")
         HTML_TEMPLATE = "<h1>模板加载失败，请联系管理员</h1>"
 
 load_html()
@@ -634,10 +719,9 @@ def background_tasks():
             if HTML_TEMPLATE != new_tpl:
                 # 仅更新原始模板;调试链接由 index() 渲染期追加,避免反复拼接
                 HTML_TEMPLATE = new_tpl
-                print("[INFO] 模板已热重载")
+                logging.info("模板已热重载")
         except Exception as e:
-            print(f"[WARN] 模板重载异常: {e}")
-
+            logging.warning(f"模板重载异常: {e}")
 if not app.debug:
     bg_thread = Thread(target=background_tasks, daemon=True)
     bg_thread.start()
@@ -653,14 +737,29 @@ def _reject(msg, status=403):
         return jsonify({'success': False, 'error': msg}), status
     return msg, status
 
+def _session_version(username):
+    """用户会话版本号:改密/重置密码时自增,使该用户旧会话(含被窃取的)全部失效。"""
+    try:
+        return int(r.get(f'sess_ver:{username}') or 0)
+    except (TypeError, ValueError):
+        return 0
+
 def login_required(f):
     @wraps(f)
     def wrap(*args, **kwargs):
         with _user_lock:
-            valid = ('user_id' in session) and (session.get('user_id') in users)
+            user = session.get('user_id')
+            valid = (user is not None) and (user in users)
         if not valid:
             if _is_api_request():
                 return jsonify({'success': False, 'error': '请先登录'}), 401
+            return redirect(url_for('login', next=request.url))
+        # 会话版本校验:改密/重置后旧会话立即失效
+        if session.get('sess_ver') != _session_version(user):
+            session.pop('user_id', None)
+            session.pop('sess_ver', None)
+            if _is_api_request():
+                return jsonify({'success': False, 'error': '会话已失效,请重新登录'}), 401
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return wrap
@@ -684,10 +783,37 @@ def is_admin(f):
     return wrap
 
 
+def _user_dirname(username):
+    """个人盘目录名:统一规范化入口。
+    adduser 已按 USERNAME_RE 校验新用户名;此处兜底历史脏数据(非法字符/超长)。"""
+    name = clean_filename(username or 'unknown')
+    return (name[:64] or 'unknown')
+
 def _personal_root(username):
     """个人盘根目录:PRIVATE_ROOT/<用户名>/。"""
-    name = clean_filename(username or 'unknown')
-    return os.path.join(PRIVATE_ROOT, name)
+    return os.path.join(PRIVATE_ROOT, _user_dirname(username))
+
+def _purge_user(username):
+    """deluser 后的清理:删除个人盘数据与分享链接,并使该用户全部会话立即失效。
+    注意:个人盘数据为物理删除;如需要可恢复窗口,可改为移入回收站。"""
+    # 1) 个人盘目录
+    priv = _personal_root(username)
+    if os.path.isdir(priv):
+        try:
+            shutil.rmtree(priv, ignore_errors=True)
+            logging.warning(f"[audit] deluser: 已删除个人盘 {priv}")
+        except Exception as e:
+            logging.error(f"删除用户 {username} 个人盘失败: {e}")
+    # 2) 分享链接(新格式记录 owner,按归属删除)
+    for key in r.scan_iter(match="share:*"):
+        try:
+            meta = json.loads(r.get(key))
+        except (TypeError, ValueError):
+            meta = None
+        if isinstance(meta, dict) and meta.get('owner') == username:
+            r.delete(key)
+    # 3) 会话失效:版本号自增,该用户旧会话(含被窃取的)全部失效
+    r.incr(f'sess_ver:{username}')
 
 def _current_root():
     """当前请求的盘根(共享盘或个人盘),在请求上下文内使用。
@@ -742,10 +868,13 @@ def _share_path_check(path):
 def clean_filename(filename):
     if not filename: return "未命名文件"
     if isinstance(filename, bytes):
-        try: filename = filename.decode('utf-8')
-        except:
-            try: filename = filename.decode('gbk')
-            except: filename = filename.decode('latin-1')
+        try:
+            filename = filename.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                filename = filename.decode('gbk')
+            except UnicodeDecodeError:
+                filename = filename.decode('latin-1')
     name, ext = os.path.splitext(filename)
     illegal = r'[\\/*?:"<>|]'
     name = re.sub(illegal, '', name).strip('. ')
@@ -776,25 +905,28 @@ def get_file_info(path):
     try:
         stat = os.stat(path)
         return {'size': stat.st_size, 'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}
-    except: return None
+    except OSError:
+        return None
 
-def _meta_base_for(scope=None):
+def _meta_base_for(scope=None, username=None):
     """元数据根目录:共享盘 META_DIR,个人盘 META_DIR/private/<用户名>/。"""
     s = scope if scope is not None else getattr(g, 'scope', 'shared')
     if s == 'personal':
-        return os.path.join(META_DIR, 'private', str(session.get('user_id') or 'unknown'))
+        # 显式传入 username(后台/无会话上下文场景),缺省用当前会话用户
+        u = username or session.get('user_id')
+        return os.path.join(META_DIR, 'private', _user_dirname(u))
     return META_DIR
 
-def _meta_dir_for(rel_path, scope=None):
-    meta_base = _meta_base_for(scope)
+def _meta_dir_for(rel_path, scope=None, username=None):
+    meta_base = _meta_base_for(scope, username)
     rel_dir = os.path.dirname(rel_path)
     if rel_dir:
         return os.path.join(meta_base, rel_dir)
     return meta_base
 
-def save_meta(rel_path, original_name, size, scope=None):
+def save_meta(rel_path, original_name, size, scope=None, username=None):
     rel_path = os.path.normpath(rel_path)   # 防御:消除 ../ 等,避免元数据目录错位
-    meta_dir = _meta_dir_for(rel_path, scope)
+    meta_dir = _meta_dir_for(rel_path, scope, username)
     os.makedirs(meta_dir, exist_ok=True)
     meta_file = os.path.join(meta_dir, os.path.basename(rel_path) + '.json')
     with open(meta_file, 'w', encoding='utf-8') as f:
@@ -865,6 +997,9 @@ def _validate_extract_members(members, target_dir, max_total=50 * 1024**3, max_e
         acc += size
         if acc > max_total:
             raise Exception("解压总大小超限")
+    # 与磁盘剩余空间比对(至少保留 512MB 余量),避免解压写满磁盘
+    if acc > shutil.disk_usage(target_dir).free - 512 * 1024 ** 2:
+        raise Exception("磁盘空间不足,无法解压")
     return total
 
 def _extract_loop(zf, members, target_dir, task_id, max_total=50 * 1024**3, max_entries=100000):
@@ -1051,6 +1186,20 @@ def zece(zip_path,target_dir,file,password,task_id):
         save_task(task_id, {'error': str(e)})
         raise e
 
+# DNS 解析线程池:getaddrinfo 阻塞且无超时,丢到池子里限时,防 worker 线程被卡死
+_dns_pool = ThreadPoolExecutor(max_workers=4)
+
+def _resolve_host(host, port=None, socktype=None):
+    """带超时的 getaddrinfo 封装;超时抛 ValueError。"""
+    kw = {}
+    if socktype is not None:
+        kw['type'] = socktype
+    fut = _dns_pool.submit(socket.getaddrinfo, host, port, **kw)
+    try:
+        return fut.result(timeout=5)
+    except TimeoutError:
+        raise ValueError(f"DNS 解析超时: {host}")
+
 def _is_blocked_ip(ip_str):
     """SSRF 防护：判断 IP 是否为内网/回环/链路本地/保留/组播等禁止访问的地址"""
     try:
@@ -1069,15 +1218,20 @@ def _check_url_host(url):
     if not host:
         raise ValueError("URL 缺少主机名")
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = _resolve_host(host, None)
     except socket.gaierror:
         raise ValueError(f"无法解析主机: {host}")
     if any(_is_blocked_ip(info[4][0]) for info in infos):
         raise ValueError(f"禁止下载内网/私网地址: {host}")
     return parsed
 
-# TLS 校验可配置（默认关闭以兼容自签名内网场景，建议生产开启）
+# TLS 校验默认关闭以兼容"固定 IP 直连"模式:该模式下 https 的证书域名与 IP 对不上,
+# 严格校验必然失败,故需 DOWNLOAD_VERIFY_TLS=0 或改用受控 DNS + 域名直连。
+# 生产建议:确认内网环境可校验后显式设置 DOWNLOAD_VERIFY_TLS=1,并只信任受控 DNS。
 DOWNLOAD_VERIFY_TLS = os.environ.get('DOWNLOAD_VERIFY_TLS', '0') == '1'
+if not DOWNLOAD_VERIFY_TLS:
+    logging.warning("DOWNLOAD_VERIFY_TLS 未开启:https 下载不做证书校验,存在中间人风险;"
+                    "请确认网络环境后显式设置(生产建议 DOWNLOAD_VERIFY_TLS=1)")
 DOWNLOAD_MAX_REDIRECTS = 5
 
 def _pin_host(url):
@@ -1091,7 +1245,7 @@ def _pin_host(url):
     default_port = 443 if parsed.scheme == 'https' else 80
     port = parsed.port or default_port
     try:
-        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        infos = _resolve_host(parsed.hostname, port, socket.SOCK_STREAM)
     except socket.gaierror:
         raise ValueError(f"无法解析主机: {parsed.hostname}")
     ips = [info[4][0] for info in infos if not _is_blocked_ip(info[4][0])]
@@ -1177,74 +1331,8 @@ def download(url, dir, task_id, cancel_check):
         raise
 
 # ==================== 模板 ====================
-LOGIN_TEMPLATE = '''
-<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>登录</title>
-<style>body{font-family:sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-.login{background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:320px}
-h2{margin-bottom:20px;color:#2c3e50;text-align:center}
-input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}
-button{width:100%;padding:10px;background:#3498db;color:#fff;border:none;border-radius:4px;cursor:pointer}
-.error{background:#f8d7da;color:#721c24;padding:10px;border-radius:4px;margin-bottom:15px}
-.info{background:#d4edda;color:#155724;padding:10px;border-radius:4px;margin-bottom:15px}
-.mute{margin-top:12px;text-align:center;font-size:13px;color:#666}
-a{color:#3498db;text-decoration:none}</style></head>
-<body><div class="login"><h2>登录</h2>
-{% if reset_ok %}<div class="info">密码已重置,请用新密码登录</div>{% endif %}
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-<form method="post">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-<input name="username" placeholder="用户名" required autofocus>
-<input type="password" name="password" placeholder="密码" required>
-<button type="submit">登录</button></form>
-<div class="mute"><a href="{{ url_for('forgot') }}">忘记密码?</a></div>
-</div></body></html>
-'''
-
-FORGOT_TEMPLATE = '''
-<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>找回密码</title>
-<style>body{font-family:sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-.login{background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:320px}
-h2{margin-bottom:20px;color:#2c3e50;text-align:center}
-input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}
-button{width:100%;padding:10px;background:#3498db;color:#fff;border:none;border-radius:4px;cursor:pointer}
-.error{background:#f8d7da;color:#721c24;padding:10px;border-radius:4px;margin-bottom:15px}
-.info{background:#d4edda;color:#155724;padding:10px;border-radius:4px;margin-bottom:15px}
-.mute{margin-top:12px;text-align:center;font-size:13px;color:#666}
-a{color:#3498db;text-decoration:none}</style></head>
-<body><div class="login"><h2>找回密码</h2>
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-{% if msg %}<div class="info">{{ msg }}</div>{% endif %}
-{% if not sent %}
-<form method="post">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-<input name="account" placeholder="用户名 或 注册邮箱" required autofocus>
-<button type="submit">发送重置链接</button></form>
-{% endif %}
-<div class="mute"><a href="{{ url_for('login') }}">返回登录</a></div>
-</div></body></html>
-'''
-
-RESET_TEMPLATE = '''
-<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>重置密码</title>
-<style>body{font-family:sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-.login{background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:320px}
-h2{margin-bottom:20px;color:#2c3e50;text-align:center}
-input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}
-button{width:100%;padding:10px;background:#3498db;color:#fff;border:none;border-radius:4px;cursor:pointer}
-.error{background:#f8d7da;color:#721c24;padding:10px;border-radius:4px;margin-bottom:15px}
-.mute{margin-top:12px;text-align:center;font-size:13px;color:#666}
-a{color:#3498db;text-decoration:none}</style></head>
-<body><div class="login"><h2>重置密码</h2>
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-<form method="post">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-<input type="hidden" name="token" value="{{ token }}">
-<input type="password" name="password" placeholder="新密码(至少8位)" required minlength="8" autofocus>
-<input type="password" name="confirm" placeholder="确认新密码" required minlength="8">
-<button type="submit">重置密码</button></form>
-<div class="mute"><a href="{{ url_for('login') }}">返回登录</a></div>
-</div></body></html>
-'''
+# 登录/找回/重置模板外置在 templates/ 目录(render_template 自动加载);
+# 主界面模板 a.html 由 load_html() 动态加载并热重载,见 _index_template()。
 
 
 # ==================== 路由 ====================
@@ -1269,7 +1357,6 @@ def _client_ip():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    logging.info(f"user logining.from {request.remote_addr}")
     error = None
     reset_ok = request.args.get('reset')
     if request.method == 'POST':
@@ -1277,34 +1364,41 @@ def login():
         fail_key = f'login_fail:{ip}'
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
-        # IP 限流 + 账号限流:防止分布式 IP 轮换绕过
+        # IP 限流(5 次)+ 账号限流(20 次):防止分布式 IP 轮换绕过;
+        # 账号阈值放宽,避免攻击者故意输错把受害者账号锁死(单点爆破由 IP 限流挡住)
         acct_key = f'login_fail_u:{username.lower()}' if username else ''
-        if int(r.get(fail_key) or 0) >= 5 or (acct_key and int(r.get(acct_key) or 0) >= 5):
+        if int(r.get(fail_key) or 0) >= LOGIN_FAIL_LIMIT or (acct_key and int(r.get(acct_key) or 0) >= LOGIN_FAIL_ACCT_LIMIT):
             error = '尝试次数过多，请10分钟后再试'
-            return render_template_string(LOGIN_TEMPLATE, error=error)
+            return render_template('login.html', error=error)
         with _user_lock:
             stored = users.get(username, '')
         if stored and check_password_hash(stored, password):
             session.clear()   # 防 session 固定攻击：登录前废弃旧会话
             session['user_id'] = username
+            session['sess_ver'] = _session_version(username)
             r.delete(fail_key)
             if acct_key:
                 r.delete(acct_key)
+            logging.info(f"user login ok: {username} from {_client_ip()}")
             return redirect(_safe_next(request.args.get('next')))
         error = '用户名或密码错误'
         r.incr(fail_key)
-        r.expire(fail_key, 600)
+        r.expire(fail_key, LOGIN_FAIL_WINDOW)
         if acct_key:
             r.incr(acct_key)
-            r.expire(acct_key, 600)
-        logging.warning(f"user login failure.from {request.remote_addr} user:{username}")
-    return render_template_string(LOGIN_TEMPLATE, error=error, reset_ok=reset_ok)
+            r.expire(acct_key, LOGIN_FAIL_WINDOW)
+        logging.warning(f"user login failure.from {_client_ip()} user:{username}")
+    return render_template('login.html', error=error, reset_ok=reset_ok)
 
 @app.route('/logout')
 def logout():
-    session.pop('user_id', None)
+    session.clear()
     logging.info("user logout")
     return redirect(url_for('login'))
+
+# 发邮件线程池:Resend API 请求最坏 15s,避免在请求/控制台线程内同步阻塞
+_mail_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='mail')
+
 
 def _send_mail(to_addr, subject, text, html=None):
     """通过 Resend API 发送邮件(DKIM/SPF 由 Resend 处理,免维护 SMTP)"""
@@ -1356,12 +1450,12 @@ def forgot():
     if request.method == 'POST':
         ip = _client_ip() or 'unknown'
         fail_key = f'forgot_fail:{ip}'
-        if int(r.get(fail_key) or 0) >= 5:
+        if int(r.get(fail_key) or 0) >= LOGIN_FAIL_LIMIT:
             error = '尝试次数过多,请10分钟后再试'
-            return render_template_string(FORGOT_TEMPLATE, error=error, msg=None, sent=False)
+            return render_template('forgot.html', error=error, msg=None, sent=False)
         # 无论账号是否存在都计数,同时防枚举与防轰炸
         r.incr(fail_key)
-        r.expire(fail_key, 600)
+        r.expire(fail_key, LOGIN_FAIL_WINDOW)
         account = request.form.get('account', '').strip()
         with _user_lock:
             username = account if account in users else None
@@ -1375,13 +1469,16 @@ def forgot():
         if username and mail and re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', mail):
             # 异步发送:Resend API 最坏阻塞 15s,不该卡住请求线程
             try:
-                Thread(target=_send_reset_mail, args=(username, mail), daemon=True).start()
+                fut = _mail_pool.submit(_send_reset_mail, username, mail)
+                fut.add_done_callback(
+                    lambda f: logging.error(f"重置邮件发送失败: {f.exception()}") if f.exception() else None
+                )
             except Exception as e:
                 logging.error(f"重置邮件线程启动失败: user={username} err={e}")
         # 统一提示,避免用户枚举
         msg = "如果该账号存在且绑定了邮箱,重置链接已发送,请查收(30分钟内有效)。"
-        return render_template_string(FORGOT_TEMPLATE, error=None, msg=msg, sent=True)
-    return render_template_string(FORGOT_TEMPLATE, error=None, msg=None, sent=False)
+        return render_template('forgot.html', error=None, msg=msg, sent=True)
+    return render_template('forgot.html', error=None, msg=None, sent=False)
 
 
 @app.route('/reset', methods=['GET', 'POST'])
@@ -1403,15 +1500,18 @@ def reset():
             else:
                 with _user_lock:
                     users[username] = generate_password_hash(password)
-                save_user()
+                    # 改内存与落库在同一把锁内完成,防止 load_redis 快照覆盖丢失更新
+                    save_user()
+                # 会话版本自增:该用户所有旧会话(含被窃取的)立即失效
+                r.incr(f'sess_ver:{username}')
                 r.delete(RESET_TOKEN_PREFIX + token)   # 一次性:用完即失效
                 logging.info(f"password reset ok: {username}")
                 return redirect(url_for('login', reset=1))
-        return render_template_string(RESET_TEMPLATE, error=error, token=token)
+        return render_template('reset.html', error=error, token=token)
     token = request.args.get('token', '')
     if not r.get(RESET_TOKEN_PREFIX + token):
-        return render_template_string(RESET_TEMPLATE, error='链接无效或已过期,请重新申请', token='')
-    return render_template_string(RESET_TEMPLATE, error=None, token=token)
+        return render_template('reset.html', error='链接无效或已过期,请重新申请', token='')
+    return render_template('reset.html', error=None, token=token)
 
 
 @app.route("/api/loginok")
@@ -1443,17 +1543,10 @@ def admin_or_no_user():
 @login_required
 @is_allowed
 def get_download_list():
-    keys = r.scan_iter(match=f"{TASK_PREFIX}*")
-    tids = []
-    for key in keys:
-        if isinstance(key, bytes):
-            tid = key.decode().split(':', 1)[-1]
-        else:
-            tid = key.split(':', 1)[-1]
-        tids.append(tid)
+    is_owner_view = session.get('user_id') != admin
+    tids = _task_ids_for_view(is_owner_view)
     all_tasks = get_tasks_bulk(tids)  # pipeline 批量读，避免逐 key N+1
     running_downloads = []
-    is_owner_view = session.get('user_id') != admin
     for tid, task in all_tasks.items():
         if str(task.get('tool_id')) == str(TOOL_DOWNLOAD) and task.get('status') == 'running':
             # 非管理员只能看到自己的下载任务
@@ -1467,19 +1560,11 @@ def get_download_list():
 @is_allowed
 def get_task_list_all():
     # 获取 Redis 中所有任务
-    keys = r.scan_iter(match=f"{TASK_PREFIX}*")
     tasks = {}
     allowed_types = (str, int, float, bool, list, dict)
-    tids = []
-    for key in keys:
-        # key 格式为 task:uuid
-        if isinstance(key, bytes):
-            tid = key.decode().split(':', 1)[-1]
-        else:
-            tid = key.split(':', 1)[-1]
-        tids.append(tid)
-    all_tasks = get_tasks_bulk(tids)  # pipeline 批量读，避免 N+1
     is_owner_view = session.get('user_id') != admin
+    tids = _task_ids_for_view(is_owner_view)
+    all_tasks = get_tasks_bulk(tids)  # pipeline 批量读，避免 N+1
     for tid, task in all_tasks.items():
         # 非管理员只能看到自己的任务
         if is_owner_view and task.get('owner') != session.get('user_id'):
@@ -1532,17 +1617,18 @@ def call_hash():
 
 
 
-_index_template_cache = {}
+_index_template_cache = [None, None]   # [tpl, compiled]:单槽缓存,模板变更时替换而非累积
 
 def _index_template():
-    """编译并缓存首页模板(避免每个请求重新解析 Jinja)。"""
+    """编译并缓存首页模板(避免每个请求重新解析 Jinja;单槽防泄漏)。"""
     tpl = HTML_TEMPLATE
     if app.debug:
         # 调试链接在渲染期追加,避免热重载时反复拼接
         tpl += "<br/>\n<a href=\"/api/new\">new</a>"
-    if tpl not in _index_template_cache:
-        _index_template_cache[tpl] = app.jinja_env.from_string(tpl)
-    return _index_template_cache[tpl]
+    if _index_template_cache[0] != tpl:
+        _index_template_cache[0] = tpl
+        _index_template_cache[1] = app.jinja_env.from_string(tpl)
+    return _index_template_cache[1]
 
 @app.route('/')
 @login_required
@@ -1550,8 +1636,8 @@ def index():
     return _index_template().render(username=session.get('user_id',''))
 
 @app.route('/api/task/<task_id>', methods=['GET'])
-@is_allowed
 @login_required
+@is_allowed
 def get_task_status(task_id):
 
     task = get_task(task_id)
@@ -1648,6 +1734,11 @@ def move_file(source, target, task_id, cancel_check):
     except ValueError as e:
         save_task(task_id, {'error': str(e)})
         return False
+    # 防目录移入自身/目标与源相同(无限递归或自覆盖)
+    overlap = _ensure_distinct_target(src, dst)
+    if overlap:
+        save_task(task_id, {'error': overlap})
+        return False
     # 同盘且目标不存在的单文件优先原子 rename(瞬间完成);否则回退复制+删除(支持取消)
     if os.path.isfile(src) and not os.path.exists(dst):
         try:
@@ -1724,6 +1815,12 @@ def copy_file(source, target, task_id, cancel_check):
         dst = resolve_target_path(src, target, root=root)
     except ValueError as e:
         save_task(task_id, {'error': str(e)})
+        return False
+
+    # 防目录复制进自身/目标与源相同(无限递归或截断源文件)
+    overlap = _ensure_distinct_target(src, dst)
+    if overlap:
+        save_task(task_id, {'error': overlap})
         return False
 
     if not os.path.exists(src):
@@ -1817,9 +1914,9 @@ def zip_ex(f,sp,password,task_id,cancel_check):
    
 
 
-    f =safe_path(f, root=_task_root(task_id))
+    f = safe_path(f, root=_task_root(task_id))
     if not os.path.exists(f):
-        
+        save_task(task_id, {'error': '文件不存在'})
         return False
     
 
@@ -1883,14 +1980,28 @@ def resolve_target_path(src_abs: str, target: str, root: str = None) -> str:
         return target_abs
     if os.path.normcase(target_abs).startswith(os.path.normcase(root_abs) + os.sep):
         return target_abs
-    raise ValueError(f"目标路径越权;{target_abs};{root_abs};{sys.platform}")
+    raise ValueError("目标路径越权")
+
+
+def _ensure_distinct_target(src, dst):
+    """防止复制/移动目标与源重叠,返回错误消息(无问题返回 None):
+    - 文件:目标与源相同会让复制操作截断源文件;
+    - 目录:目标位于源内部会造成无限递归复制,直至写满磁盘。"""
+    src_real = os.path.realpath(src)
+    dst_real = os.path.realpath(dst)
+    if os.path.normcase(dst_real) == os.path.normcase(src_real):
+        return '目标不能与源路径相同'
+    if os.path.isdir(src_real) and os.path.normcase(dst_real).startswith(os.path.normcase(src_real) + os.sep):
+        return '目标不能位于源目录内部'
+    return None
 
 
 @app.route('/api/disk_usage')
 @is_allowed
 @login_required
 def get_du():
-    a,b,c = shutil.disk_usage(UPLOAD_DIR)
+    # 按当前盘(共享盘/个人盘)口径统计,个人盘不再显示共享盘容量
+    a,b,c = shutil.disk_usage(_current_root())
     return jsonify({'total':a,"used":b,"free":c})
 
 
@@ -1903,8 +2014,9 @@ def call_tool():
     if limit_resp:
         return limit_resp
     try:
-        a = request.json
-        a=dict(a)
+        a = request.get_json(silent=True)
+        if not isinstance(a, dict):
+            return jsonify({'success': False, 'error': '无效请求数据'}), 400
         logging.info(f"call_tool {a}")
         tool_id = a.get("tool")
         args_raw = a.get("args", "").strip()
@@ -1938,8 +2050,8 @@ def call_tool():
                 chunk_size = int(m.group(1))
             except ValueError:
                 return jsonify({'success': False, 'error': '块大小必须为整数'}), 400
-            if not (1 <= chunk_size <= 1024 ** 3):
-                return jsonify({'success': False, 'error': '块大小超出允许范围(1~1GB)'}), 400
+            if not (1 <= chunk_size <= 64 * 1024 ** 2):
+                return jsonify({'success': False, 'error': '块大小超出允许范围(1~64MB)'}), 400
             file_path = m.group(2)
             fp_clean = clean_arg(file_path)
             func = tool.u1.call
@@ -1995,6 +2107,9 @@ def upload_file():
     except ValueError as e:
         return jsonify({'success': False, 'error': f'目录非法: {str(e)}'}), 400
     os.makedirs(target_dir, exist_ok=True)
+    # 磁盘余量预检:至少保留 1GB 安全余量,防并发上传灌满磁盘
+    if shutil.disk_usage(target_dir).free < (request.content_length or 0) + 1024 ** 3:
+        return jsonify({'success': False, 'error': '磁盘空间不足,请稍后再试'}), 507
     filename = clean_filename(original)
     try:
         filepath, out = _reserve_upload_path(target_dir, filename)
@@ -2016,14 +2131,311 @@ def upload_file():
             pass
         return jsonify({'success': False, 'error': f'保存失败: {str(e)}'}), 500
 
+
+def _tus_tmp_base(scope):
+    """tus 临时目录:与目标盘同盘(. 开头,文件列表自动隐藏)。
+    临时文件与最终落盘位置同文件系统,保证 os.replace 原子完成,
+    磁盘余量检查口径也与目标盘一致。"""
+    base = UPLOAD_DIR if scope != 'personal' else PRIVATE_ROOT
+    d = os.path.join(base, '.tus_tmp')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+# 单次上传总量上限(字节,环境变量可调)
+TUS_MAX_UPLOAD_SIZE = _env_int('TUS_MAX_UPLOAD_SIZE', 10 * 1024**3)
+# 上传无活动过期时间(秒):期间没有 PATCH 即视为放弃
+TUS_UPLOAD_TTL = _env_int('TUS_UPLOAD_TTL', 24 * 3600)
+TUS_PREFIX = 'tus:'
+# 单次 PATCH 分片上限(独立于全局 MAX_CONTENT_LENGTH,默认同为 1GB);并发写锁防同进程双 PATCH 交错
+TUS_MAX_PATCH_SIZE = _env_int('TUS_MAX_PATCH_SIZE', 1024 * 1024 * 1024)
+_tus_write_lock = RLock()
+
+
+def _tus_key(upload_id):
+    return TUS_PREFIX + upload_id
+
+
+def _tus_tmp_path(upload_id, tmp_dir=None):
+    return os.path.join(tmp_dir or _tus_tmp_base('shared'), upload_id)
+
+
+def _tus_meta(upload_id):
+    raw = r.get(_tus_key(upload_id))
+    if not raw:
+        return None
+    try:
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _parse_tus_metadata(header):
+    """解析 Upload-Metadata 头:逗号分隔的 'key base64url(value)' 对。"""
+    out = {}
+    if not header:
+        return out
+    for pair in header.split(','):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(' ', 1)
+        key = parts[0].strip()
+        val = ''
+        if len(parts) == 2:
+            s = parts[1].strip()
+            try:
+                val = base64.urlsafe_b64decode(s + '=' * (-len(s) % 4)).decode('utf-8', 'replace')
+            except (ValueError, TypeError):
+                val = ''
+        out[key] = val
+    return out
+
+
+def _tus_response(body='', status=204, **headers):
+    """统一 tus 响应:tus 规范要求响应携带 Tus-Resumable 头。"""
+    resp = make_response(body, status)
+    resp.headers['Tus-Resumable'] = '1.0.0'
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
+def _tus_finish(upload_id, meta):
+    """上传完成:原子移动到目标目录并写元数据;失败返回 False(丢弃本次上传)。"""
+    target_dir = meta.get('target_dir') or UPLOAD_DIR
+    filename = meta.get('filename') or '未命名文件'
+    tmp = _tus_tmp_path(upload_id, meta.get('tmp_dir'))
+    final_path = None
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        # 目标文件名冲突时生成唯一名:O_EXCL 占位后原子替换占位
+        name, ext = os.path.splitext(filename)
+        counter = 1
+        candidate = filename
+        while True:
+            cand = os.path.join(target_dir, candidate)
+            try:
+                fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                final_path = cand
+                break
+            except FileExistsError:
+                counter += 1
+                candidate = f"{name} ({counter}){ext}" if counter <= 1000 else f"{name}_{int(time.time() * 1000) % 1000000}{ext}"
+        try:
+            os.replace(tmp, final_path)
+        except OSError:
+            # 跨文件系统回退为复制+删除(非原子,罕见场景)
+            shutil.move(tmp, final_path)
+        size = os.path.getsize(final_path)
+        scope = meta.get('scope', 'shared')
+        root = _root_for_scope(scope, meta.get('owner'))
+        rel = os.path.relpath(final_path, root)
+        save_meta(rel, filename, size, scope=scope, username=meta.get('owner'))
+        return True
+    except Exception as e:
+        app.logger.error(f"tus 完成落盘失败: {e}")
+        if final_path and os.path.exists(final_path):
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+        return False
+    finally:
+        r.delete(_tus_key(upload_id))
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.route('/api/tus', methods=['POST'])
+@is_allowed
+@login_required
+def tus_create():
+    """tus creation:POST /api/tus,必须携带 Upload-Length;成功返回 Location。"""
+    if request.headers.get('Tus-Resumable') != '1.0.0':
+        return _tus_response('unsupported tus version', 412)
+    length_str = request.headers.get('Upload-Length', '').strip()
+    if not length_str.isdigit():
+        return _tus_response('Upload-Length 缺失或非法', 400)
+    length = int(length_str)
+    if length > TUS_MAX_UPLOAD_SIZE:
+        return _tus_response(f'上传超过大小上限 {TUS_MAX_UPLOAD_SIZE} 字节', 413)
+    meta = _parse_tus_metadata(request.headers.get('Upload-Metadata', ''))
+    filename = clean_filename(meta.get('filename', ''))
+    if filename in RESERVED_NAMES:
+        return _tus_response('名称被系统保留', 400)
+    folder = meta.get('path', '').strip().replace('\\', '/')
+    if any(part in RESERVED_NAMES for part in folder.split('/') if part):
+        return _tus_response('目录名被系统保留', 400)
+    try:
+        target_dir = safe_path(folder, root=_current_root()) if folder else _current_root()
+    except ValueError:
+        return _tus_response('目标目录非法', 400)
+    os.makedirs(target_dir, exist_ok=True)
+    scope = getattr(g, 'scope', 'shared')
+    tmp_base = _tus_tmp_base(scope)
+    # 磁盘余量预检:按临时目录(与目标同盘)口径,至少保留 1GB 安全余量
+    if shutil.disk_usage(tmp_base).free < length + 1024 ** 3:
+        return _tus_response('磁盘空间不足,请稍后再试', 507)
+    upload_id = uuid.uuid4().hex
+    tmp = _tus_tmp_path(upload_id, tmp_base)
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except OSError:
+        return _tus_response('创建上传失败', 500)
+    r.set(_tus_key(upload_id), json.dumps({
+        'scope': scope,
+        'owner': session.get('user_id', ''),
+        'filename': filename,
+        'target_dir': target_dir,
+        'tmp_dir': tmp_base,
+        'length': length,
+        'created': time.time(),
+    }))
+    r.expire(_tus_key(upload_id), TUS_UPLOAD_TTL)
+    location = url_for('tus_upload', upload_id=upload_id)
+    if scope == 'personal':
+        location = PERSONAL_URL_PREFIX + location   # 个人盘补 /p 前缀,避免 scope 漂移
+    return _tus_response('', 201, **{'Location': location})
+
+
+@app.route('/api/tus/<upload_id>', methods=['PATCH'])
+@is_allowed
+@login_required
+def tus_upload(upload_id):
+    """tus upload:PATCH /api/tus/<id>,Content-Type: application/offset+octet-stream。"""
+    if request.headers.get('Tus-Resumable') != '1.0.0':
+        return _tus_response('unsupported tus version', 412)
+    meta = _tus_meta(upload_id)
+    if not meta:
+        return _tus_response('上传不存在或已过期', 404)
+    user = session.get('user_id')
+    if meta.get('owner') != user and user != admin:
+        return _tus_response('无权操作该上传', 403)
+    if request.headers.get('Content-Type', '').lower() != 'application/offset+octet-stream':
+        return _tus_response('Content-Type 必须为 application/offset+octet-stream', 400)
+    tmp = _tus_tmp_path(upload_id, meta.get('tmp_dir'))
+    # 读-校验-写整体加锁,防同进程双 PATCH 交错(跨进程由 offset 校验兜底)
+    with _tus_write_lock:
+        try:
+            offset = os.path.getsize(tmp)
+        except OSError:
+            return _tus_response('上传数据丢失', 404)
+        # 顺序校验:客户端声明的 offset 必须与当前一致,不一致返回 409
+        if request.headers.get('Upload-Offset') != str(offset):
+            return _tus_response('offset 不匹配,请重试', 409)
+        # 磁盘余量检查(至少保留 512MB;注意是 MB,勿写成 512*1024**3=512GB)
+        if shutil.disk_usage(os.path.dirname(tmp)).free < 512 * 1024 ** 2:
+            return _tus_response('磁盘空间不足,请稍后再试', 507)
+        try:
+            with open(tmp, 'ab') as f:
+                written = 0
+                while True:
+                    chunk = request.stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    if written + len(chunk) > TUS_MAX_PATCH_SIZE:
+                        return _tus_response('单次分片超过大小限制', 413)
+                    if offset + written + len(chunk) > meta['length']:
+                        return _tus_response('数据超出声明长度', 413)
+                    f.write(chunk)
+                    written += len(chunk)
+        except OSError as e:
+            app.logger.error(f"tus 写入失败: {e}")
+            return _tus_response('写入失败', 500)
+        new_offset = offset + written
+        r.expire(_tus_key(upload_id), TUS_UPLOAD_TTL)
+        if new_offset >= meta['length']:
+            if not _tus_finish(upload_id, meta):
+                return _tus_response('上传完成但落盘失败,请重新上传', 500)
+        return _tus_response('', 204, **{'Upload-Offset': str(new_offset)})
+
+
+@app.route('/api/tus/<upload_id>', methods=['HEAD'])
+@is_allowed
+@login_required
+def tus_head(upload_id):
+    """tus HEAD:查询已上传字节数(断点续传依据)。"""
+    meta = _tus_meta(upload_id)
+    if not meta:
+        return _tus_response('', 404)
+    user = session.get('user_id')
+    if meta.get('owner') != user and user != admin:
+        return _tus_response('', 403)
+    try:
+        offset = os.path.getsize(_tus_tmp_path(upload_id, meta.get('tmp_dir')))
+    except OSError:
+        return _tus_response('', 404)
+    return _tus_response('', 200, **{'Upload-Offset': str(offset), 'Upload-Length': str(meta['length'])})
+
+
+@app.route('/api/tus/<upload_id>', methods=['DELETE'])
+@is_allowed
+@login_required
+def tus_terminate(upload_id):
+    """tus termination:取消上传并清理临时文件。"""
+    meta = _tus_meta(upload_id)
+    if not meta:
+        return _tus_response('', 404)
+    user = session.get('user_id')
+    if meta.get('owner') != user and user != admin:
+        return _tus_response('', 403)
+    r.delete(_tus_key(upload_id))
+    tmp = _tus_tmp_path(upload_id, meta.get('tmp_dir'))
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return _tus_response('', 204)
+
+
+def tus_autoclear():
+    """清理过期/失效的 tus 临时文件:redis 记录不存在即视为过期,删除磁盘实体。
+    共享盘与个人盘的临时目录都扫。"""
+    for base in (_tus_tmp_base('shared'), _tus_tmp_base('personal')):
+        try:
+            for name in os.listdir(base):
+                if r.exists(_tus_key(name)):
+                    continue
+                path = os.path.join(base, name)
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                    elif os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+        except OSError as e:
+            logging.warning(f"tus 清理异常({base}): {e}")
+
+
+def while_tus_autodelete():
+    while True:
+        time.sleep(600)
+        tus_autoclear()
+
+
+tus_autoclear()   # 启动时清理一次残留
+Thread(target=while_tus_autodelete, daemon=True).start()
+
+# tus 客户端不会携带 CSRF token;端点已有登录+归属校验,且 SameSite=Lax 挡跨站携带 cookie,故豁免
+for _tus_view in (tus_create, tus_upload, tus_head, tus_terminate):
+    csrf.exempt(_tus_view)
+
 @app.route("/api/new")
-def sssss():
+def reload_template():
     if app.debug:
         try:
             load_html()
-            print("[INFO] 模板已热重载")
+            logging.info("模板已热重载")
         except Exception as e:
-            print(f"[WARN] 模板重载异常: {e}")
+            logging.warning(f"模板重载异常: {e}")
         return redirect("/")
     else:
         return redirect("/")
@@ -2040,6 +2452,8 @@ def sssss():
 @is_allowed
 def list_files():
     rel_path = request.args.get('path', '').strip()
+    limit = request.args.get('limit', type=int)
+    offset = request.args.get('offset', type=int) or 0
     try:
         target_dir = safe_path(rel_path, root=_current_root()) if rel_path else _current_root()
     except ValueError:
@@ -2049,14 +2463,26 @@ def list_files():
     items = []
 
     try:
-        for name in os.listdir(target_dir):
+        # scandir 一次目录遍历即拿到类型/stat,比 listdir+isdir+isfile+stat 少 3 次系统调用
+        for entry in os.scandir(target_dir):
+            name = entry.name
             if name.startswith('.') or name == 'metadata' or name == 'chunks': continue
-            full = os.path.join(target_dir, name)
-            is_dir = os.path.isdir(full)
-            ext = os.path.splitext(full)[1] if os.path.isfile(full) else ""
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            ext = os.path.splitext(name)[1] if not is_dir else ""
             is_archive = ext in ('.zip', '.7z')   # 与 zip_ex 实际支持的格式一致
 
-            info = {} if is_dir else (get_file_info(full) or {})
+            if is_dir:
+                info = {}
+            else:
+                try:
+                    st = entry.stat()
+                    info = {'size': st.st_size,
+                            'modified': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}
+                except OSError:
+                    info = {}
             items.append({
                 'name': name,   # JSON 返回原始名，HTML 转义交给前端
                 'type': 'directory' if is_dir else 'file',
@@ -2066,6 +2492,9 @@ def list_files():
                 'type_zip': is_archive
             })
         items.sort(key=lambda x: (0 if x['type']=='directory' else 1, x['name'].lower()))
+        # 可选分页:limit/offset 参数,缺省返回全部(兼容现有前端)
+        if offset or limit is not None:
+            items = items[offset: offset + limit if limit else None]
     except Exception as e:
         logging.error(str(e))
         return jsonify({'success': False, 'error': "see log"}), 500
@@ -2081,6 +2510,8 @@ def create_folder():
     parent = data.get('path', '').strip()
     name = data.get('name', '').strip()
     if not name: return jsonify({'success': False, 'error': '名称不能为空'}), 400
+    if name in ('.', '..'):
+        return jsonify({'success': False, 'error': '名称不合法'}), 400
     if re.search(r'[\\/*?:"<>|]', name):
         return jsonify({'success': False, 'error': '名称包含非法字符'}), 400
     if name in RESERVED_NAMES:
@@ -2133,7 +2564,7 @@ def delete_item(item_path):
             'scope': scope,
             'owner': session.get('user_id', '')
         }
-        r.setex(f"trash:{item_id}", 86400 * 10, json.dumps(meta))  # 10天过期（与 TTL 一致）
+        r.setex(f"trash:{item_id}", TRASH_TTL, json.dumps(meta))  # 10天过期（与 TTL 一致）
 
         # 删除原有元数据（可选，如果需要恢复元数据请保留）
         # 这里保留原有元数据删除逻辑，因为恢复时会重新生成
@@ -2158,7 +2589,7 @@ def delete_item(item_path):
 @is_allowed
 @login_required
 def share_put():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     file = data.get('file')
     try:
         full = safe_path(file, root=_current_root())
@@ -2166,21 +2597,57 @@ def share_put():
         return jsonify({'success': False, 'error': '路径非法'}), 400
     if not os.path.isfile(full):
         return jsonify({'success': False, 'error': '文件不存在'}), 404
+    scope = getattr(g, 'scope', 'shared')
+    owner = session.get('user_id', '')
+    root = _root_for_scope(scope, owner)
+    rel = os.path.relpath(full, root)
     u = str(uuid.uuid4())
-    r.setex(f"share:{u}", 86400, full)   # 24小时过期
+    # 只存相对路径 + 归属,不落盘绝对路径(防泄露服务器目录结构);
+    # 下载时按 scope/owner 重新拼盘根并校验,链接无法指向他人盘内文件
+    r.setex(f"share:{u}", SHARE_TTL, json.dumps({
+        'scope': scope, 'owner': owner, 'rel_path': rel, 'created': time.time(),
+    }))
     host = request.host_url
     return jsonify({'link': host + "share/share_get/" + u})
 
 @app.route('/share/share_get/<path:uuid>')
 def down(uuid):
-    file_path = r.get(f"share:{uuid}")
-    if not file_path:
+    raw = r.get(f"share:{uuid}")
+    if not raw:
         abort(404)
     try:
-        full = _share_path_check(file_path)
-    except ValueError as e:
-        abort(404)
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        # 新格式:按归属盘根重新拼接相对路径,不信任任何存储的绝对路径
+        scope = meta.get('scope', 'shared')
+        owner = meta.get('owner', '')
+        rel_path = meta.get('rel_path', '')
+        if scope == 'personal' and not owner:
+            abort(404)
+        root = _root_for_scope(scope, owner)
+        try:
+            full = safe_path(rel_path, root=root)
+        except ValueError:
+            abort(404)
+    else:
+        # 旧格式(纯绝对路径字符串):兼容存量链接,仍做越权检查
+        try:
+            full = _share_path_check(raw)
+        except ValueError:
+            abort(404)
     if not os.path.isfile(full): abort(404)
+    # 分享下载限流:同一 IP 每分钟最多 SHARE_RATE_LIMIT 次,防刷带宽/磁盘 IO
+    ip = _client_ip() or 'unknown'
+    rl_key = f'share_rl:{ip}'
+    if int(r.get(rl_key) or 0) >= SHARE_RATE_LIMIT:
+        abort(429)
+    r.incr(rl_key)
+    r.expire(rl_key, 60)
+    # 与 URL 下载一致的大小上限,防分享超大文件
+    if DOWNLOAD_MAX_SIZE and os.path.getsize(full) > DOWNLOAD_MAX_SIZE:
+        abort(413)
     
     dirname = os.path.dirname(full)
     filename = os.path.basename(full)
@@ -2222,12 +2689,18 @@ def web_download_file(file_path):
     except ValueError:
         abort(404)
     if not os.path.isfile(full): abort(404)
+    # 与 URL 下载一致的大小上限(0=不限制),防超大文件流式下载刷磁盘 IO
+    if DOWNLOAD_MAX_SIZE and os.path.getsize(full) > DOWNLOAD_MAX_SIZE:
+        abort(413)
     dirname = os.path.dirname(full)
     filename = os.path.basename(full)
     resp = make_response(send_from_directory(dirname, filename, as_attachment=True))
     resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
     return resp
 
+
+# 回收站恢复/清理的进程内互斥锁(防同进程并发恢复时的目标路径竞态)
+_trash_lock = RLock()
 
 def trash_autoclear():
     n = []
@@ -2245,7 +2718,7 @@ def trash_autoclear():
     return n
 def while_trash_autodelete():
     while True:
-        time.sleep(10)
+        time.sleep(60)   # 回收站条目有 10 天 TTL,60 秒扫一次足够,避免高频全扫
         trash_autoclear()
 Thread(target=while_trash_autodelete,daemon=True).start(
 )
@@ -2305,28 +2778,31 @@ def trash_restore(item_id):
     root = _root_for_scope(scope, owner)
     target_full = safe_path(original_rel, root=root)  # 验证路径安全
 
-    # 如果原路径已存在，则自动重命名（加“_恢复”后缀）
-    if os.path.exists(target_full):
-        base, ext = os.path.splitext(target_full)
-        counter = 1
-        while os.path.exists(f"{base}_恢复{counter}{ext}"):
-            counter += 1
-        target_full = f"{base}_恢复{counter}{ext}"
-        # 更新原始路径（用于后续元数据,相对所属盘根;个人盘不能相对 UPLOAD_DIR）
-        original_rel = os.path.relpath(target_full, root)
-
-    try:
-        # 移动回原位置
-        shutil.move(trash_path, target_full)
-        # 删除 Redis 记录
-        r.delete(f"trash:{item_id}")
-        # 重新生成元数据（如果是文件）
-        if not meta['is_dir']:
-            save_meta(original_rel, os.path.basename(target_full), os.path.getsize(target_full), scope=scope)
-        return jsonify({'success': True})
-    except Exception as e:
-        logging.error(str(e))
-        return jsonify({'success': False, 'error': str(e)}), 500
+    # 锁内完成"目标已存在→改名"与"移动"两步,消除检查与执行之间的 TOCTOU
+    with _trash_lock:
+        # 如果原路径已存在，则自动重命名（加“_恢复”后缀）
+        if os.path.exists(target_full):
+            base, ext = os.path.splitext(target_full)
+            counter = 1
+            while os.path.exists(f"{base}_恢复{counter}{ext}"):
+                counter += 1
+            target_full = f"{base}_恢复{counter}{ext}"
+            # 更新原始路径（用于后续元数据,相对所属盘根;个人盘不能相对 UPLOAD_DIR）
+            original_rel = os.path.relpath(target_full, root)
+        try:
+            # 移动回原位置
+            shutil.move(trash_path, target_full)
+            # 删除 Redis 记录
+            r.delete(f"trash:{item_id}")
+            # 重新生成元数据（如果是文件）;必须传 username=owner,
+            # 否则 admin 恢复他人个人盘文件时元数据会落进 admin 自己的 meta 目录
+            if not meta['is_dir']:
+                save_meta(original_rel, os.path.basename(target_full), os.path.getsize(target_full),
+                          scope=scope, username=owner)
+            return jsonify({'success': True})
+        except Exception as e:
+            logging.error(str(e))
+            return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/trash/delete/<item_id>', methods=['DELETE'])
 @is_allowed
@@ -2354,9 +2830,22 @@ def trash_delete(item_id):
 @is_allowed
 @login_required
 def trash_clear():
+    """清空回收站:管理员清全部,普通用户只能清自己的条目(防越权删除他人文件)。"""
+    is_admin_view = session.get('user_id') == admin
     keys = r.scan_iter(match="trash:*")
     for key in keys:
         item_id = key.split(':', 1)[-1]
+        meta_json = r.get(key)
+        if not meta_json:
+            r.delete(key)
+            continue
+        try:
+            meta = json.loads(meta_json)
+        except (TypeError, ValueError):
+            r.delete(key)
+            continue
+        if not is_admin_view and meta.get('owner') != session.get('user_id'):
+            continue
         trash_path = os.path.join(TRASH_DIR, item_id)
         if os.path.exists(trash_path):
             if os.path.isdir(trash_path):
@@ -2376,6 +2865,16 @@ def not_found(e):
 @app.errorhandler(CSRFError)
 def handle_csrf_error(e):
     return jsonify({'success': False, 'error': 'CSRF验证失败'}), 400
+
+@app.route('/healthz')
+def healthz():
+    """存活探针(免认证):Redis 可用即视为健康,供负载均衡/监控使用。"""
+    try:
+        r.ping()
+        return 'ok', 200
+    except Exception as e:
+        logging.error(f"healthz 失败: {e}")
+        return 'redis down', 503
 
 @app.errorhandler(413)
 def handle_too_large(e):
@@ -2429,6 +2928,9 @@ def create_file(filename):
 # 服务端静态 RSA 密钥:启动时生成一次。每连接重新生成 3072 位密钥(约数百毫秒~数秒)
 # 会被连接洪水打成 CPU DoS,必须复用。
 _ADMIN_RSA_PRIVATE_KEY = RSA.generate(3072)
+# 管理控制台并发连接上限:多 IP 连接洪水也打不穿线程池(握手限流只按单 IP)
+ADMIN_MAX_CONNS = _env_int('ADMIN_MAX_CONNS', 8)
+_admin_conn_sem = BoundedSemaphore(ADMIN_MAX_CONNS)
 
 
 def _admin_conn_throttle(ip):
@@ -2444,7 +2946,7 @@ def _pick_transfer_port():
     """挑选空闲端口并生成一次性传输 token。
     注:选端口与 bind 之间存在 TOCTOU,但传输端口有 token 认证兜底。"""
     while True:
-        sm = random.randint(ADMIN_PORT_MIN, ADMIN_PORT_MAX)
+        sm = secrets.randbelow(ADMIN_PORT_MAX - ADMIN_PORT_MIN + 1) + ADMIN_PORT_MIN
         if not is_port_in_use(sm):
             break
     return sm, secrets.token_urlsafe(16)
@@ -2540,7 +3042,7 @@ def w(port, lock: filelock.FileLock):
         for _cmd in ('ping', 'python', 'python3', 'ls', 'echo'):
             r.sadd('command', _cmd)
 
-    print('等待管理连接...', flush=True)
+    logging.info('管理控制台监听中...')
     while True:
         try:
             sf, client_addr = s.accept()
@@ -2548,13 +3050,27 @@ def w(port, lock: filelock.FileLock):
             # 偶发 EINTR/资源问题，短暂退避后继续
             time.sleep(0.2)
             continue
-        print(f"新连接来自 {client_addr}", flush=True)
+        logging.info(f"新连接来自 {client_addr}")
         # 每连接一个线程，挂起/闲置的连接不再阻塞后续连接
         t = Thread(target=_handle_admin_conn, args=(sf, client_addr), daemon=True)
         t.start()
 
 
 def _handle_admin_conn(sock, client_addr):
+    """单个管理连接的入口:受并发上限约束后转内部处理。"""
+    if not _admin_conn_sem.acquire(timeout=10):
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return
+    try:
+        _handle_admin_conn_inner(sock, client_addr)
+    finally:
+        _admin_conn_sem.release()
+
+
+def _handle_admin_conn_inner(sock, client_addr):
     """单个管理连接的完整生命周期：握手 -> 认证 -> 命令循环。"""
     session_key = None
     # 认证失败限流键前缀（Redis 存储，1 小时过期）
@@ -2563,13 +3079,13 @@ def _handle_admin_conn(sock, client_addr):
     try:
         # 握手前按源 IP 限流:连接洪水不再能触发每连接一次的 RSA 公钥生成/加密运算
         if not _admin_conn_throttle(client_addr[0]):
-            print(f"管理连接过频,拒绝 {client_addr}", flush=True)
+            logging.warning(f"管理连接过频,拒绝 {client_addr}")
             try:
                 sock.close()
             except Exception:
                 pass
             return
-        sock.settimeout(30)   # 握手阶段超时，防止客户端挂起占用连接
+        sock.settimeout(ADMIN_HANDSHAKE_TIMEOUT)   # 握手阶段超时，防止客户端挂起占用连接
         # 1. 发送公钥（长度前缀 + 公钥数据）
         private_key = _ADMIN_RSA_PRIVATE_KEY   # 静态密钥:避免每连接生成 3072 位密钥
         public_key = private_key.publickey()
@@ -2600,9 +3116,9 @@ def _handle_admin_conn(sock, client_addr):
         # 失败限流:按源 IP 为键(客户端自报 ID 可被换号绕过,不可信),失败 >=5 次锁定 1 小时
         fail_key = AUTH_FAIL_PREFIX + str(client_addr[0])
         fail_cnt = int(r.get(fail_key) or 0)
-        if fail_cnt >= 5:
+        if fail_cnt >= ADMIN_AUTH_FAIL_LIMIT:
             # 打印不含明文密码（nm[1] 为密码，禁止输出）
-            print(f"认证已锁定: user={nm[0] if len(nm) > 0 else '?'} client={nm[2] if len(nm) > 2 else '?'}", flush=True)
+            logging.warning(f"认证已锁定: user={nm[0] if len(nm) > 0 else '?'} client={nm[2] if len(nm) > 2 else '?'}")
             send_plain(sock, "n", session_key)
             send_enc_frame(sock, session_key, b'\4')
             time.sleep(1)   # 失败节流，抑制 CPU DoS
@@ -2614,12 +3130,12 @@ def _handle_admin_conn(sock, client_addr):
             r.delete(fail_key)   # 成功后清零计数
             send_plain(sock, "y", session_key)
             send_enc_frame(sock, session_key, b'\4')
-            print('认证成功', flush=True)
+            logging.info('认证成功')
         else:
             r.incr(fail_key)
-            r.expire(fail_key, 3600)
+            r.expire(fail_key, ADMIN_AUTH_LOCKOUT)
             # 打印不含明文密码（nm[1] 为密码，禁止输出）
-            print(f"认证失败: user={nm[0] if len(nm) > 0 else '?'} client={nm[2] if len(nm) > 2 else '?'}", flush=True)
+            logging.warning(f"认证失败: user={nm[0] if len(nm) > 0 else '?'} client={nm[2] if len(nm) > 2 else '?'}")
             send_plain(sock, "n", session_key)
             send_enc_frame(sock, session_key, b'\4')
             time.sleep(1)   # 失败节流，抑制 CPU DoS
@@ -2638,11 +3154,11 @@ def _handle_admin_conn(sock, client_addr):
         return
 
     # 认证完成：空闲超时 300 秒，挂起/闲置的连接不会永久占用控制台
-    sock.settimeout(300)
+    sock.settimeout(ADMIN_IDLE_TIMEOUT)
     try:
         _admin_command_loop(sock, session_key)
     except socket.timeout:
-        print(f"管理连接空闲超时,断开 {client_addr}", flush=True)
+        logging.info(f"管理连接空闲超时,断开 {client_addr}")
     except Exception as e:
         traceback.print_exc()
         try:
@@ -2654,7 +3170,7 @@ def _handle_admin_conn(sock, client_addr):
             sock.close()
         except Exception:
             pass
-        print(f"管理连接关闭 {client_addr}", flush=True)
+        logging.debug(f"管理连接关闭 {client_addr}")
 
 
 def _admin_command_loop(sock, session_key):
@@ -2798,15 +3314,27 @@ def _admin_command_loop(sock, session_key):
                 elif ddd.startswith("open "):
                     parts = ddd.split(None, 1)
                     code = parts[1] if len(parts) == 2 else ''
+                    # 验证码尝试限流:同一来源 IP 连续失败 10 次,锁 10 分钟
+                    try:
+                        peer_ip = sock.getpeername()[0]
+                    except OSError:
+                        peer_ip = 'unknown'
+                    attempt_key = f'debug_open_fail:{peer_ip}'
+                    if int(r.get(attempt_key) or 0) >= 10:
+                        send_plain(sock, "验证码尝试次数过多,请10分钟后再试", session_key)
+                        continue
                     if code and r.get(DEBUG_CODE_PREFIX + code):
                         r.delete(DEBUG_CODE_PREFIX + code)   # 一次性:用完即失效
+                        r.delete(attempt_key)
                         create_file(os.path.join(BASE_DIR, "de.lock"))
                         app.debug = True
                         logging.warning(f"[audit] debug mode OPEN (by {sock.getpeername()})")
                         send_plain(sock, "debug mode open ok", session_key)
                     else:
-                        # 验证码错误/过期:节流 + 日志(不输出验证码明文)
-                        print(f"debug open 验证码错误: client={sock.getpeername()}", flush=True)
+                        # 验证码错误/过期:计数 + 节流 + 日志(不输出验证码明文)
+                        r.incr(attempt_key)
+                        r.expire(attempt_key, 600)
+                        logging.warning(f"debug open 验证码错误: client={sock.getpeername()}")
                         time.sleep(1)
                         send_plain(sock, "debug open refused: 验证码错误或已过期", session_key)
                 elif ddd == "close":
@@ -2825,6 +3353,8 @@ def _admin_command_loop(sock, session_key):
                         exists = username in users
                     if exists:
                         send_plain(sock, '用户已存在', session_key)
+                    elif not USERNAME_RE.match(username):
+                        send_plain(sock, '用户名仅允许字母/数字/_- ,长度 1~32', session_key)
                     elif len(password) < 8:
                         send_plain(sock, '密码至少 8 位', session_key)
                     elif not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', mail):
@@ -2834,9 +3364,9 @@ def _admin_command_loop(sock, session_key):
                             users[username] = generate_password_hash(password)
                             user_list.append(username)
                             user_emails[username] = mail
+                            save_user()   # 与内存修改同一把锁内落库,防 load_redis 覆盖丢失
                         send_plain(sock, f"用户 *** 已添加(邮箱 {mail})", session_key)
                         logging.warning(f"[audit] adduser: {username} (by {sock.getpeername()})")
-                        save_user()
                 else:
                     send_plain(sock, 'usage: adduser <user> <password> <mail@Example.com>', session_key)
 
@@ -2854,8 +3384,8 @@ def _admin_command_loop(sock, session_key):
                     else:
                         with _user_lock:
                             user_emails[username] = mail
+                            save_user()   # 锁内落库,防 load_redis 覆盖丢失
                         send_plain(sock, f"邮箱已更新: {username} -> {mail}", session_key)
-                        save_user()
                 else:
                     send_plain(sock, 'usage: setmail <user> <mail@Example.com>', session_key)
 
@@ -2863,6 +3393,9 @@ def _admin_command_loop(sock, session_key):
                 parts = [p for p in cmd.split() if p]
                 if len(parts) == 2:
                     username = parts[1]
+                    if username == admin:
+                        send_plain(sock, '不能删除管理员账号', session_key)
+                        continue
                     with _user_lock:
                         if username in users and username in user_list:
                             del users[username]
@@ -2876,10 +3409,13 @@ def _admin_command_loop(sock, session_key):
                             deleted = True
                         else:
                             deleted = False
+                        if deleted:
+                            save_user()   # 锁内落库,防 load_redis 快照覆盖把已删用户"复活"
                     if deleted:
+                        # 锁外清理:个人盘/分享链接/会话,避免长操作占锁
+                        _purge_user(username)
                         send_plain(sock, f"用户 *** 已删除", session_key)
                         logging.warning(f"[audit] deluser: {username} (by {sock.getpeername()})")
-                        save_user()
                     else:
                         send_plain(sock, "用户不存在", session_key)
 
@@ -2891,17 +3427,16 @@ def _admin_command_loop(sock, session_key):
                         if user in blocked_users:
                             role += " forbid"
                         else:
-                            if user not in user_list:
-                                user_list.append(user)
+                            # 只读展示,不在列表操作中写数据(避免副作用)
                             role += " authorized"
                         if user == admin:
                             role += " admin"
                         email = user_emails.get(user, '')
                         info.append(f"--{user} {role}  {email}")
                 send_plain(sock, "\n".join(info), session_key)
-                save_user()
 
-            elif cmd.lower().startswith("addnigga "):
+            # 兼容旧命令 addnigga/delnigga;新命令名为 block/unblock
+            elif cmd.lower().startswith(("addnigga ", "block ")):
                 parts = [p for p in cmd.split() if p]
                 if len(parts) == 2:
                     username = parts[1]
@@ -2915,10 +3450,10 @@ def _admin_command_loop(sock, session_key):
                             blocked_users.append(username)
                             if username in user_list:
                                 user_list.remove(username)
+                            save_user()   # 锁内落库
                         send_plain(sock, f"用户 *** 已移入黑名单", session_key)
-                        save_user()
 
-            elif cmd.lower().startswith("delnigga "):
+            elif cmd.lower().startswith(("delnigga ", "unblock ")):
                 parts = [p for p in cmd.split() if p]
                 if len(parts) == 2:
                     username = parts[1]
@@ -2932,8 +3467,8 @@ def _admin_command_loop(sock, session_key):
                             blocked_users.remove(username)
                             if username not in user_list:
                                 user_list.append(username)
+                            save_user()   # 锁内落库
                         send_plain(sock, f"用户 *** 已移出黑名单", session_key)
-                        save_user()
 
             elif cmd.lower().startswith("setadmin "):
                 parts = [p for p in cmd.split() if p]
@@ -2947,9 +3482,9 @@ def _admin_command_loop(sock, session_key):
                     elif in_list:
                         with _user_lock:
                             admin = username
+                            save_user()   # 锁内落库
                         send_plain(sock, f"用户 *** 已设为管理员", session_key)
                         logging.warning(f"[audit] setadmin: {username} (by {sock.getpeername()})")
-                        save_user()
 
             elif app.debug and cmd.lower().startswith("get "):
                 parts = cmd.split()
@@ -3031,7 +3566,7 @@ def _admin_command_loop(sock, session_key):
                     process = subprocess.Popen([exe] + tokens[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, cwd=UPLOAD_DIR, text=True, env=env)
                     stdin_thread = None
                     if stdin_on:
-                        print('term', flush=True)
+                        logging.debug('term')
                         stdin_thread = Thread(target=stdin_shell, name='command', args=(process, sock, session_key, stop_event), daemon=True)
                         stdin_thread.start()
                     # 用底层 fd 的 os.read：管道一有数据就返回（不攒满 4096），保证实时回显。
@@ -3115,6 +3650,17 @@ def _admin_command_loop(sock, session_key):
                 send_enc_frame(sock, session_key, b'\4')
             except Exception:
                 break
+def _bind_transfer_socket(sock, ip, port):
+    """绑定传输监听端口:客户端指定 IP 绑定失败(如非本机接口)时回退到 ADMIN_BIND。"""
+    for addr in (ip, ADMIN_BIND):
+        try:
+            sock.bind((addr, port))
+            return True
+        except OSError as e:
+            logging.warning(f"绑定 {addr}:{port} 失败: {e}")
+    return False
+
+
 def _recv_token(con, token, timeout=10):
     """传输连接认证:接收长度(4)+token 字节并恒定时间比对。失败/超时返回 False。"""
     try:
@@ -3136,20 +3682,28 @@ def _recv_token(con, token, timeout=10):
 def update_file(ip,port,token):
     n = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     n.settimeout(30)   # 客户端拿了端口不来连时,线程不会永久挂起
-    n.bind((ip,port))
+    if not _bind_transfer_socket(n, ip, port):
+        n.close()
+        return
     n.listen(1)
     try:
         con,addr = n.accept()
     except socket.timeout:
-        print('update accept timeout', flush=True)
+        logging.warning('update accept timeout')
         n.close()
         return
     try:
         if not _recv_token(con, token):
-            print('update token mismatch', flush=True)
+            logging.warning('update token mismatch')
+            return
+        # 认证后仍保留空闲超时(_recv_token 内部会清掉超时),防线程永久挂起
+        con.settimeout(TRANSFER_IDLE_TIMEOUT)
+        # 磁盘余量预检:至少保留 1GB,防大文件写满磁盘
+        if shutil.disk_usage(UPLOAD_DIR).free < 1024 ** 3:
+            logging.error('update 磁盘空间不足,拒绝接收')
             return
         if not recv_file(con, save_dir=UPLOAD_DIR, max_size=1024 * 1024 * 1024):
-            print('error', flush=True)
+            logging.error('update 接收文件失败')
     finally:
         con.close()
         n.close()
@@ -3157,25 +3711,29 @@ def update_file(ip,port,token):
 def download_file(ip,port,token):
     n = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     n.settimeout(30)   # 同 update_file:防线程永久挂起
-    n.bind((ip,port))
+    if not _bind_transfer_socket(n, ip, port):
+        n.close()
+        return
     n.listen(1)
     try:
         con,addr = n.accept()
     except socket.timeout:
-        print('download accept timeout', flush=True)
+        logging.warning('download accept timeout')
         n.close()
         return
     try:
         if not _recv_token(con, token):
-            print('download token mismatch', flush=True)
+            logging.warning('download token mismatch')
             return
+        # 认证后仍保留空闲超时(_recv_token 内部会清掉超时),防线程永久挂起
+        con.settimeout(TRANSFER_IDLE_TIMEOUT)
         # 客户端发送：struct.pack('!I', len(name)) + name.encode()
         raw_len = con.recv(4)
         if len(raw_len) < 4:
             return
         name_len = struct.unpack('!I', raw_len)[0]
         if name_len > 4096:
-            print('download name too long', flush=True)
+            logging.warning('download name too long')
             return
         name = b''
         while len(name) < name_len:
@@ -3187,12 +3745,12 @@ def download_file(ip,port,token):
         try:
             file_path = safe_path(file_rel)  # 仅允许 UPLOAD_DIR 内文件，防任意读取
         except ValueError:
-            print('download path not allowed', flush=True)
+            logging.warning('download path not allowed')
         else:
             if not os.path.isfile(file_path):
-                print('download file not found', flush=True)
+                logging.warning('download file not found')
             elif not send_file(con, file_path):
-                print('error', flush=True)
+                logging.error('download 发送文件失败')
     finally:
         con.close()
         n.close()
@@ -3204,31 +3762,31 @@ lock = filelock.SoftFileLock('.admin_lock')
 
 
 if __name__ == '__main__':
-    print(f"🌐 启动：http://0.0.0.0:5000\n访问http://{socket.gethostbyname(socket.gethostname())}:5000", flush=True)
+    HOST = os.environ.get('HOST', '0.0.0.0')
+    PORT = _env_int('PORT', 5000)
+    logging.info(f"🌐 启动: http://{HOST}:{PORT} (本机访问 http://{socket.gethostbyname(socket.gethostname())}:{PORT})")
     # 仅当显式允许（ALLOW_DE_LOCK=1）时才由 de.lock 文件开启 debug，
     # 避免残留文件意外打开 get/cr 等调试命令的攻击面
     if os.environ.get('ALLOW_DE_LOCK', '0') == '1' and os.path.exists(os.path.join(BASE_DIR, "de.lock")):
         app.debug = True  # 调试链接由 index() 渲染期追加
     while True:
-        sm = random.randint(ADMIN_PORT_MIN, ADMIN_PORT_MAX)
+        sm = secrets.randbelow(ADMIN_PORT_MAX - ADMIN_PORT_MIN + 1) + ADMIN_PORT_MIN
         if not is_port_in_use(sm):
             break
     
     r.set('man_port',sm)
-    print(f"管理端口链接:{socket.gethostbyname(socket.gethostname())}:{sm}",flush=True)
     logging.info(f"管理端口链接:{socket.gethostbyname(socket.gethostname())}:{sm}")
     s = Thread(target=w, daemon=True,args=(sm, lock))
     s.start()
-    app.run("0.0.0.0", 5000, use_reloader=False,use_evalex=False)
+    app.run(HOST, PORT, use_reloader=False,use_evalex=False)
 else:
     try:
         # 本 worker 抢到了锁，负责启动管理端口
         lock.acquire(timeout=1)
         while True:
-            sm = random.randint(ADMIN_PORT_MIN, ADMIN_PORT_MAX)
+            sm = secrets.randbelow(ADMIN_PORT_MAX - ADMIN_PORT_MIN + 1) + ADMIN_PORT_MIN
             if not is_port_in_use(sm):
                 break
-        print(f"管理端口链接: {socket.gethostbyname(socket.gethostname())}:{sm}", flush=True)
         logging.info(f"管理端口链接: {socket.gethostbyname(socket.gethostname())}:{sm}")
         r.set('man_port',sm)
         s = Thread(target=w, daemon=True, args=(sm,lock))
@@ -3237,4 +3795,5 @@ else:
 
             
         
-    except filelock.Timeout as e:print('no lock')
+    except filelock.Timeout as e:
+        logging.info('管理端口已被其它 worker 占用,跳过')

@@ -190,12 +190,12 @@ body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
       <h3>Call_tool</h3>
       <div>
         tools<select id="tools_select">
-          <option value="1">Assembly</option>
-          <option value="2">Cut</option>
+          <option value="2">Assembly</option>
+          <option value="1">Cut</option>
           <option value="3">help</option>
         </select>
         <br>
-        <input type="text" id="args" placeholder="参数">
+        <input type="text" id="args" placeholder="分割: -c 块大小 -f 文件路径;合成: 目录路径">
         <div class="modal-actions">
           <button class="btn btn-success" onclick="call_tool_a()">调用</button>
           <button class="btn" onclick="document.getElementById('fuck').style.display='none'">取消</button>
@@ -237,6 +237,8 @@ let selectedFiles = [];
 let uploading = false;
 let activeUploads = 0;
 const MAX_CONCURRENT = 3;
+const TUS_CHUNK = 8 * 1024 * 1024;      // tus 分片大小(字节)
+const TUS_THRESHOLD = 5 * 1024 * 1024;  // 超过此大小的文件自动走 tus 断点续传
 let tid;
 const taskPollers = {};  // 存储下载任务轮询定时器
 
@@ -360,10 +362,7 @@ async function get_du() {
 // ========== 文件选择与列表 ==========
 function addFiles(files) {
   for (let f of files) {
-    if (f.size > 200 * 1024 * 1024) {
-      showStatus('文件 ' + f.name + ' 超过200MB，请使用大文件上传', 'error');
-      continue;
-    }
+    // 大文件不再拒绝:>= TUS_THRESHOLD 的文件会自动走 tus 断点续传
     if (!selectedFiles.some(x => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) {
       selectedFiles.push(f);
     }
@@ -442,7 +441,11 @@ function uploadFiles() {
     while (activeUploads < MAX_CONCURRENT && uploadQueue.length > 0) {
       const file = uploadQueue.shift();
       activeUploads++;
-      const worker = uploadFileWithProgress(file, currentPath, progressElements.get(file))
+      // 大文件走 tus 断点续传,小文件走原普通上传
+      const doUpload = file.size >= TUS_THRESHOLD
+        ? uploadFileTusWithProgress(file, currentPath, progressElements.get(file))
+        : uploadFileWithProgress(file, currentPath, progressElements.get(file));
+      const worker = doUpload
         .then(() => { completed++; })
         .catch(() => { failed++; })
         .finally(() => {
@@ -510,6 +513,106 @@ function uploadFileWithProgress(file, folder, progressItemDiv) {
     xhr.addEventListener('error', () => { statusSpan.textContent = '网络错误'; statusSpan.style.color = '#e74c3c'; reject(new Error('网络错误')); });
     xhr.addEventListener('abort', () => { statusSpan.textContent = '已取消'; reject(new Error('已取消')); });
     xhr.send(formData);
+  });
+}
+
+// ========== tus 断点续传客户端(零依赖,实现 tus 1.0.0 子集) ==========
+function b64url(str) {
+  // 浏览器 base64 → base64url(无 padding),用于 Upload-Metadata
+  return btoa(unescape(encodeURIComponent(str))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function tusCreate(file, folder) {
+  // POST /api/tus 创建上传,返回 Location(可能带 /p 前缀,apiUrl 会自动处理)
+  return fetch(apiUrl('/api/tus'), {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {
+      'Tus-Resumable': '1.0.0',
+      'Upload-Length': String(file.size),
+      'Upload-Metadata': 'filename ' + b64url(file.name) + ',path ' + b64url(folder || '')
+    }
+  }).then(r => {
+    if (r.status === 201) return r.headers.get('Location');
+    if (r.status === 401) throw new Error('登录过期');
+    return r.text().then(t => { throw new Error(t || ('创建上传失败 ' + r.status)); });
+  });
+}
+
+function tusHead(url) {
+  // HEAD 查询已上传字节数(断点续传依据)
+  return fetch(apiUrl(url), {
+    method: 'HEAD',
+    credentials: 'same-origin',
+    headers: { 'Tus-Resumable': '1.0.0' }
+  }).then(r => {
+    if (r.status !== 200) throw new Error('查询进度失败 ' + r.status);
+    return parseInt(r.headers.get('Upload-Offset') || '0', 10);
+  });
+}
+
+function tusPatch(url, blob, offset, onProgress) {
+  // PATCH 追加一个分片(XHR 以便监听上传进度),resolve 新 offset
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PATCH', apiUrl(url), true);
+    xhr.setRequestHeader('Tus-Resumable', '1.0.0');
+    xhr.setRequestHeader('Upload-Offset', String(offset));
+    xhr.setRequestHeader('Content-Type', 'application/offset+octet-stream');
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 204) {
+        resolve(parseInt(xhr.getResponseHeader('Upload-Offset') || String(offset + blob.size), 10));
+      } else {
+        reject(new Error('分片上传失败 ' + xhr.status + ' ' + xhr.responseText));
+      }
+    });
+    xhr.addEventListener('error', () => reject(new Error('网络错误')));
+    xhr.send(blob);
+  });
+}
+
+async function tusUpload(file, folder, onProgress) {
+  // 断点续传:失败重试时重新 HEAD,已上传部分自动跳过
+  let url = await tusCreate(file, folder);
+  let offset = await tusHead(url);
+  let tries = 0;
+  while (offset < file.size) {
+    const blob = file.slice(offset, offset + TUS_CHUNK);
+    try {
+      offset = await tusPatch(url, blob, offset, (loaded) => {
+        onProgress(offset + loaded, file.size);
+      });
+      tries = 0;
+    } catch (e) {
+      tries++;
+      if (tries > 3) throw e;
+      offset = await tusHead(url);   // 服务器端已写入部分自动跳过
+      await new Promise(r => setTimeout(r, 1000 * tries));
+    }
+  }
+  return url;
+}
+
+function uploadFileTusWithProgress(file, folder, progressItemDiv) {
+  // tus 上传 + 进度 UI(复用现有进度条结构)
+  const progressInner = progressItemDiv.querySelector('.progress-inner');
+  const statusSpan = progressItemDiv.querySelector('.status-text');
+  statusSpan.textContent = '准备中';
+  return tusUpload(file, folder, (loaded, total) => {
+    const percent = Math.round((loaded / total) * 100);
+    progressInner.style.width = percent + '%';
+    statusSpan.textContent = percent + '%';
+  }).then(() => {
+    progressInner.style.width = '100%';
+    statusSpan.textContent = '完成';
+    statusSpan.style.color = '#27ae60';
+  }).catch((e) => {
+    statusSpan.textContent = e.message || '失败';
+    statusSpan.style.color = '#e74c3c';
+    throw e;
   });
 }
 

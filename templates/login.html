@@ -1,0 +1,20 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>登录</title>
+<style>body{font-family:sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+.login{background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:320px}
+h2{margin-bottom:20px;color:#2c3e50;text-align:center}
+input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}
+button{width:100%;padding:10px;background:#3498db;color:#fff;border:none;border-radius:4px;cursor:pointer}
+.error{background:#f8d7da;color:#721c24;padding:10px;border-radius:4px;margin-bottom:15px}
+.info{background:#d4edda;color:#155724;padding:10px;border-radius:4px;margin-bottom:15px}
+.mute{margin-top:12px;text-align:center;font-size:13px;color:#666}
+a{color:#3498db;text-decoration:none}</style></head>
+<body><div class="login"><h2>登录</h2>
+{% if reset_ok %}<div class="info">密码已重置,请用新密码登录</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input name="username" placeholder="用户名" required autofocus>
+<input type="password" name="password" placeholder="密码" required>
+<button type="submit">登录</button></form>
+<div class="mute"><a href="{{ url_for('forgot') }}">忘记密码?</a></div>
+</div></body></html>

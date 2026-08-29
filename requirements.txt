@@ -1,0 +1,24 @@
+# Web 框架
+flask>=3.0
+flask-cors>=4.0
+flask-wtf>=1.2
+
+# 存储(任务/用户/限流)
+redis>=5.0
+
+# 系统/文件
+psutil>=5.9
+filelock>=3.13
+
+# 压缩/解压(zip / 加密 zip / 7z)
+pyzipper>=0.3
+py7zr>=0.20
+
+# 网络(URL 下载 / Resend 邮件)
+requests>=2.31
+
+# 加密(管理控制台 RSA/AES)
+pycryptodome>=3.19
+
+# 生产部署(可选)
+gunicorn>=21.2
