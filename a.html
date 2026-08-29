@@ -1,0 +1,1429 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<title>文件管理</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+
+#disk_usage
+{
+	border:1px solid #000000;
+	padding:10px 40px; 
+	background:#ffffff;
+	width:50em;
+	border-radius:25px;
+  float:unset;
+}
+
+body{font-family:'Segoe UI',Roboto,sans-serif;background:#f5f5f5;padding:20px}
+
+.container{max-width:1200px;margin:0 auto;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}
+.header{background:#2c3e50;color:#fff;padding:20px 30px;display:flex;justify-content:space-between;align-items:center}
+.header a{color:#fff;text-decoration:underline}
+.main{padding:25px}
+.breadcrumb{background:#f0f0f0;padding:10px;border-radius:4px;margin-bottom:20px}
+.breadcrumb a{cursor:pointer;color:#3498db;text-decoration:none}
+.upload-area{border:2px dashed #3498db;border-radius:6px;padding:40px;text-align:center;margin-bottom:20px;background:#f8fafc}
+.btn{display:inline-block;padding:8px 16px;background:#3498db;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px;margin:2px}
+.btn:hover{background:#2980b9}
+.btn-success{background:#27ae60}
+.btn-danger{background:#e74c3c}
+.btn-outline{background:transparent;color:#3498db;border:1px solid #3498db}
+.btn-small{padding:4px 10px;font-size:13px}
+.btn-group{margin:15px 0;display:flex;gap:8px;flex-wrap:wrap}
+.selected-list{max-height:150px;overflow-y:auto;margin:10px 0;background:#f9f9f9;border:1px solid #eee;border-radius:4px;padding:10px;display:none}
+.selected-item{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.status{display:none;padding:10px;border-radius:4px;margin:10px 0}
+.status.success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}
+.status.error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}
+.file-list{max-height:500px;overflow-y:auto}
+.file-item{display:flex;align-items:center;padding:10px;background:#f8f9fa;border-radius:4px;margin-bottom:8px}
+.file-icon{font-size:24px;margin-right:15px}
+.file-info{flex:1}
+.file-name{font-weight:500;word-break:break-all}
+.file-meta{font-size:13px;color:#666}
+.folder-name{color:#2c3e50;cursor:pointer;font-weight:500}
+.folder-name:hover{text-decoration:underline}
+.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);align-items:center;justify-content:center;z-index:1000}
+.modal-content{background:#fff;padding:25px;border-radius:8px;width:90%;max-width:500px}
+.modal-content input{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;margin:10px 0}
+.progress-bar{width:100%;height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;margin:10px 0}
+.progress-inner{height:100%;background:#27ae60;width:0%;transition:width 0.3s}
+.upload-progress-container { margin: 15px 0; max-height: 300px; overflow-y: auto; }
+.upload-progress-item { display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #eee; }
+.upload-progress-item .file-icon { margin-right: 10px; }
+.upload-progress-item .file-details { flex: 1; min-width: 0; }
+.upload-progress-item .file-details .file-name { font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.upload-progress-item .progress-bar { margin: 0; }
+.upload-progress-item .status-text { margin-left: 10px; font-size: 13px; white-space: nowrap; }
+
+.task-progress-item { border: 1px solid #ddd; padding: 10px; margin-bottom: 8px; border-radius: 4px; background: #fff; }
+.task-progress-item .progress-bar { margin: 5px 0; }
+/* 回收站样式增强 */
+.trash-item { display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #eee; }
+.trash-item .info { flex: 1; }
+.trash-item .info .name { font-weight: 500; }
+.trash-item .info .meta { font-size: 12px; color: #666; }
+
+/* 任务管理样式 */
+.task-item { border: 1px solid #ddd; padding: 10px; margin-bottom: 8px; border-radius: 4px; background: #fff; }
+.task-item .task-actions { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>📁 文件管理</h1><div><span>欢迎, {{ username }} | </span><span id="scopeSwitch"></span><a href="/logout">退出</a></div></div>
+<div class="main">
+<div class="breadcrumb" id="breadcrumb"><a onclick="nav('')">根目录</a></div>
+
+<div class="upload-area" id="dropArea">
+  <h3>拖拽文件到此处或点击下方按钮选择</h3>
+  <p>当前目录：<strong id="curDir">根目录</strong></p>
+  <button class="btn" id="fileSelectBtn" style="margin-top:10px">选择文件</button>
+  <input type="file" id="fileInput" multiple style="display:none">
+</div>
+
+<div class="selected-list" id="selectedList"></div>
+<div class="btn-group">
+  <button class="btn btn-success" id="uploadBtn">开始上传</button>
+  <button class="btn" id="testBtn">测试上传</button>
+  <button class="btn" id="call">调用工具</button>
+  <button class="btn" id="download">下载</button>
+  <button class="btn btn-outline" id="newFolderBtn">新建文件夹</button>
+  <button class="btn btn-outline" id="trashBtn">回收站</button>
+  <button class="btn btn-outline" id="taskManagerBtn">任务管理</button>
+  <button class="btn btn-danger" id="clearSelBtn">清空选择</button>
+</div>
+<div class="status" id="statusMsg">
+  <div style="float: right;"><a href="javascript:closestatus()" style="color: rgb(255, 0, 0);"> X</a> </div>
+    <div id="stw"></div>
+</div>
+<!-- 下载任务进度容器 -->
+<div id="taskProgressContainer"></div>
+<!-- 多文件上传进度区域 -->
+<div class="upload-progress-container" id="uploadProgressContainer"></div>
+
+<div style="margin-top:20px">
+  <h3>目录内容</h3>
+  <button class="btn btn-danger btn-small" id="clearAllBtn" style="float:right">清空所有</button>
+  <div class="file-list" id="fileList"><p>暂无内容</p></div>
+</div>
+</div>
+</div>
+
+<br /><br />
+<div id="disk_usage"></div>
+
+<!-- 文件/文件夹操作模态框（单文件） -->
+<div class="modal" id="file">
+  <div class="modal-content">
+    <h3>操作文件/文件夹</h3>
+    <select id="file_action">
+      <option value=1>移动</option>
+      <option value=3>复制</option>
+      <option value="5">计算哈希</option>
+    </select>
+  <br>
+    目标路径: <input type="text" id="file_path" placeholder="目标路径">
+    <br>
+    <div class="modal-actions">
+      <button class="btn" onclick="upok = 2">取消</button>
+      <button class="btn btn-success" onclick="ca()">操作</button>
+    </div>
+  </div>
+</div>
+
+<!-- 文件/文件夹操作模态框（含解压） -->
+<div class="modal" id="file2">
+  <div class="modal-content">
+    <h3>操作文件/文件夹</h3>
+    <select id="file_action2">
+      <option value=1>移动</option>
+      <option value=4>解压</option>
+      <option value=3>复制</option>
+      <option value="5">计算哈希</option>
+    </select>
+  <br>
+    目标路径: <input type="text" id="file_path_2" placeholder="目标路径">
+    <div id="passwordt" style="display:none"> 
+    密码: <input type="text" id="password" placeholder="密码(如果有的话)" >
+    </div>
+    <br>
+    <div class="modal-actions">
+      <button class="btn" onclick="upok = 2">取消</button>
+      <button class="btn btn-success" onclick="ca2()">操作</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建文件夹模态框 -->
+<div class="modal" id="folderModal">
+  <div class="modal-content">
+    <h3>新建文件夹</h3>
+    <input type="text" id="folderName" placeholder="文件夹名称">
+    <div class="modal-actions">
+      <button class="btn" onclick="document.getElementById('folderModal').style.display='none'">取消</button>
+      <button class="btn btn-success" onclick="createFolder()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- 下载模态框 -->
+<div class="modal" id="helo">
+  <div class="modal-content">
+    <h3>下载</h3>
+    <input type="text" id="urls" placeholder="地址">
+    <br>
+    <div class="modal-actions">
+      <button class="btn btn-success" onclick="download()">下载</button>
+      <button class="btn" onclick="document.getElementById('helo').style.display='none'">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 调用工具模态框 -->
+<div class="modal" id="fuck">
+  <div class="modal-content">
+      <h3>Call_tool</h3>
+      <div>
+        tools<select id="tools_select">
+          <option value="1">Assembly</option>
+          <option value="2">Cut</option>
+          <option value="3">help</option>
+        </select>
+        <br>
+        <input type="text" id="args" placeholder="参数">
+        <div class="modal-actions">
+          <button class="btn btn-success" onclick="call_tool_a()">调用</button>
+          <button class="btn" onclick="document.getElementById('fuck').style.display='none'">取消</button>
+        </div>
+      </div>
+  </div>
+</div>
+
+<!-- ====== 回收站模态框 ====== -->
+<div class="modal" id="trashModal">
+  <div class="modal-content" style="max-width:700px;">
+    <h3>🗑️ 回收站</h3>
+    <div id="trashList" style="max-height:400px;overflow-y:auto;"></div>
+    <div class="modal-actions" style="margin-top:15px;">
+      <button class="btn btn-danger" id="clearTrashBtn">清空回收站</button>
+      <button class="btn" onclick="document.getElementById('trashModal').style.display='none'">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 任务管理模态框 ====== -->
+<div class="modal" id="taskModal">
+  <div class="modal-content" style="max-width:750px;">
+    <h3>📋 任务管理</h3>
+    <div id="taskList" style="max-height:400px;overflow-y:auto;margin-top:10px;">
+      <p>加载中...</p>
+    </div>
+    <div class="modal-actions" style="margin-top:15px;">
+      <button class="btn btn-success" onclick="loadTasks()">🔄 刷新</button>
+      <button class="btn" onclick="document.getElementById('taskModal').style.display='none'">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ========== 全局状态 ==========
+let currentPath = '';
+let selectedFiles = [];
+let uploading = false;
+let activeUploads = 0;
+const MAX_CONCURRENT = 3;
+let tid;
+const taskPollers = {};  // 存储下载任务轮询定时器
+
+function getCsrfToken() {
+  return document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+}
+
+// ========== 共享盘/个人盘 ==========
+function isPersonal() {
+  return location.pathname === '/p' || location.pathname.startsWith('/p/');
+}
+function apiUrl(url) {
+  if (isPersonal() && typeof url === 'string' && url.startsWith('/') && !url.startsWith('/p')) {
+    return '/p' + url;
+  }
+  return url;
+}
+function renderScopeSwitch() {
+  const el = document.getElementById('scopeSwitch');
+  if (!el) return;
+  if (isPersonal()) {
+    el.innerHTML = '<span style="color:#ffd700">[个人盘]</span> <a href="/" style="color:#fff">切到共享盘</a> | ';
+  } else {
+    el.innerHTML = '<span>[共享盘]</span> <a href="/p" style="color:#ffd700">切到个人盘</a> | ';
+  }
+}
+
+function csrfFetch(url, options = {}) {
+  if (!options.headers) options.headers = {};
+  options.headers['X-CSRFToken'] = getCsrfToken();
+  options.credentials = 'same-origin';
+  return fetch(apiUrl(url), options);
+}
+
+// ========== 初始化事件绑定 ==========
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('fileSelectBtn').addEventListener('click', function() {
+    document.getElementById('fileInput').click();
+  });
+
+  document.getElementById('fileInput').addEventListener('change', function(e) {
+    if (e.target.files.length) {
+      addFiles(e.target.files);
+      this.value = '';
+    }
+  });
+
+  const dropArea = document.getElementById('dropArea');
+  dropArea.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    dropArea.style.borderColor = '#2ecc71';
+  });
+  dropArea.addEventListener('dragleave', function() {
+    dropArea.style.borderColor = '#3498db';
+  });
+  dropArea.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropArea.style.borderColor = '#3498db';
+    if (e.dataTransfer.files.length) {
+      addFiles(e.dataTransfer.files);
+    }
+  });
+
+  document.getElementById('uploadBtn').addEventListener('click', uploadFiles);
+  document.getElementById('testBtn').addEventListener('click', testUpload);
+  document.getElementById('clearSelBtn').addEventListener('click', clearSelection);
+  document.getElementById('clearAllBtn').addEventListener('click', clearAll);
+  document.getElementById('call').addEventListener('click',function() {
+      document.getElementById("fuck").style.display = 'flex'
+      document.getElementById('args').value = '';
+      document.getElementById('args').focus();
+  });
+  document.getElementById("download").addEventListener('click',function() {
+      document.getElementById("helo").style.display = 'flex'
+      document.getElementById('urls').value = '';
+      document.getElementById('urls').focus();
+  });
+
+  document.getElementById('newFolderBtn').addEventListener('click', function() {
+    document.getElementById('folderModal').style.display = 'flex';
+    document.getElementById('folderName').value = '';
+    document.getElementById('folderName').focus();
+  });
+
+  // 回收站按钮
+  document.getElementById('trashBtn').addEventListener('click', function() {
+    document.getElementById('trashModal').style.display = 'flex';
+    loadTrash();
+  });
+  document.getElementById('clearTrashBtn').addEventListener('click', clearTrash);
+
+  // 任务管理按钮
+  document.getElementById('taskManagerBtn').addEventListener('click', openTaskManager);
+
+  get_du();
+  refresh();
+  renderScopeSwitch();
+  loadDownloadTasks();   // 自动加载下载任务进度
+});
+
+async function get_du() {
+  try {
+    const response = await csrfFetch('/api/disk_usage');
+    if (!response.ok) {
+      console.error('磁盘使用信息获取失败:', response.status);
+      document.getElementById('disk_usage').innerHTML = '无法获取磁盘信息';
+      return;
+    }
+    const data = await response.json();
+    const totalGB = (data.total / (1024 ** 3)).toFixed(2);
+    const usedGB = (data.used / (1024 ** 3)).toFixed(2);
+    const freeGB = (data.free / (1024 ** 3)).toFixed(2);
+    document.getElementById('disk_usage').innerHTML =
+      `总空间: ${totalGB} GB | 已用: ${usedGB} GB | 剩余: ${freeGB} GB`;
+  } catch (error) {
+    console.error('获取磁盘使用率出错:', error);
+    document.getElementById('disk_usage').innerHTML = '加载磁盘信息失败';
+  }
+}
+
+// ========== 文件选择与列表 ==========
+function addFiles(files) {
+  for (let f of files) {
+    if (f.size > 200 * 1024 * 1024) {
+      showStatus('文件 ' + f.name + ' 超过200MB，请使用大文件上传', 'error');
+      continue;
+    }
+    if (!selectedFiles.some(x => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) {
+      selectedFiles.push(f);
+    }
+  }
+  updateSelectedList();
+}
+
+function updateSelectedList() {
+  const el = document.getElementById('selectedList');
+  if (selectedFiles.length === 0) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  el.style.display = 'block';
+  let html = '<strong>已选文件：</strong><br>';
+  selectedFiles.forEach((f, i) => {
+    html += `<div class="selected-item"><span>${f.name} (${(f.size/1024).toFixed(1)} KB)</span>
+             <button class="btn btn-danger btn-small" onclick="removeSelected(${i})">移除</button></div>`;
+  });
+  el.innerHTML = html;
+}
+
+function removeSelected(index) {
+  selectedFiles.splice(index, 1);
+  updateSelectedList();
+}
+
+function clearSelection() {
+  selectedFiles = [];
+  updateSelectedList();
+  document.getElementById('fileInput').value = '';
+}
+
+let upok = 0;
+
+// ========== 普通上传 ==========
+function uploadFiles() {
+  if (!selectedFiles.length) {
+    showStatus('请先选择文件', 'error');
+    return;
+  }
+  if (uploading) {
+    showStatus('正在上传中，请稍候', 'error');
+    return;
+  }
+  uploading = true;
+  const container = document.getElementById('uploadProgressContainer');
+  container.innerHTML = '';
+
+  let total = selectedFiles.length;
+  let completed = 0;
+  let failed = 0;
+
+  const progressElements = new Map();
+  selectedFiles.forEach(file => {
+    const itemDiv = document.createElement('div');
+    itemDiv.className = 'upload-progress-item';
+    itemDiv.innerHTML = `
+      <div class="file-icon">📄</div>
+      <div class="file-details">
+        <div class="file-name">${file.name}</div>
+        <div class="progress-bar"><div class="progress-inner" style="width:0%"></div></div>
+      </div>
+      <span class="status-text">等待上传</span>
+    `;
+    container.appendChild(itemDiv);
+    progressElements.set(file, itemDiv);
+  });
+
+  const uploadQueue = [...selectedFiles];
+  const workers = [];
+
+  const processNext = () => {
+    if (uploadQueue.length === 0) return;
+    while (activeUploads < MAX_CONCURRENT && uploadQueue.length > 0) {
+      const file = uploadQueue.shift();
+      activeUploads++;
+      const worker = uploadFileWithProgress(file, currentPath, progressElements.get(file))
+        .then(() => { completed++; })
+        .catch(() => { failed++; })
+        .finally(() => {
+          activeUploads--;
+          if (completed + failed === total) {
+            uploading = false;
+            showStatus(`上传完成：成功 ${completed} 个，失败 ${failed} 个`, failed ? 'error' : 'success');
+            selectedFiles = [];
+            updateSelectedList();
+            refresh();
+            setTimeout(() => { container.innerHTML = ''; }, 3000);
+          } else {
+            processNext();
+          }
+        });
+      workers.push(worker);
+    }
+  };
+
+  processNext();
+}
+
+function uploadFileWithProgress(file, folder, progressItemDiv) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('folder', folder);
+    xhr.open('POST', apiUrl('/file/upload'), true);
+    xhr.setRequestHeader('X-CSRFToken', getCsrfToken());
+
+    const progressInner = progressItemDiv.querySelector('.progress-inner');
+    const statusSpan = progressItemDiv.querySelector('.status-text');
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.round((e.loaded / e.total) * 100);
+        progressInner.style.width = percent + '%';
+        statusSpan.textContent = `${percent}%`;
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 401) { statusSpan.textContent = '登录过期'; statusSpan.style.color = '#e74c3c'; reject(new Error('登录过期')); return; }
+      if (xhr.status === 413) { statusSpan.textContent = '文件过大'; statusSpan.style.color = '#e74c3c'; reject(new Error('文件过大')); return; }
+      try {
+        const data = JSON.parse(xhr.responseText);
+        if (data.success) {
+          progressInner.style.width = '100%';
+          statusSpan.textContent = '完成';
+          statusSpan.style.color = '#27ae60';
+          resolve();
+        } else {
+          statusSpan.textContent = data.error || '失败';
+          statusSpan.style.color = '#e74c3c';
+          reject(new Error(data.error));
+        }
+      } catch (e) {
+        statusSpan.textContent = '响应解析错误';
+        statusSpan.style.color = '#e74c3c';
+        reject(e);
+      }
+    });
+
+    xhr.addEventListener('error', () => { statusSpan.textContent = '网络错误'; statusSpan.style.color = '#e74c3c'; reject(new Error('网络错误')); });
+    xhr.addEventListener('abort', () => { statusSpan.textContent = '已取消'; reject(new Error('已取消')); });
+    xhr.send(formData);
+  });
+}
+
+function testUpload() {
+  const testFile = new File(['测试内容'], 'test.txt', {type: 'text/plain'});
+  selectedFiles = [testFile];
+  updateSelectedList();
+  uploadFiles();
+}
+
+// ========== 目录浏览与操作 ==========
+async function refresh() {
+  try {
+    const resp = await csrfFetch('/api/files?path=' + encodeURIComponent(currentPath));
+    if (resp.status === 401) { showStatus('登录已过期，请刷新页面重新登录', 'error'); return; }
+    const data = await resp.json();
+    if (data.success) {
+      renderFileList(data.data);
+      document.getElementById('curDir').textContent = currentPath || '根目录';
+      updateBreadcrumb();
+    } else {
+      showStatus(data.error || '加载目录失败', 'error');
+    }
+  } catch (e) {
+    console.error('刷新目录出错:', e);
+    showStatus('网络错误，无法加载目录', 'error');
+  }
+}
+
+function renderFileList(items) {
+  const el = document.getElementById('fileList');
+  if (!items || !items.length) { el.innerHTML = '<p>暂无内容</p>'; return; }
+  let html = '';
+  items.forEach(item => {
+    const itemPath = currentPath ? currentPath + '/' + item.name : item.name;
+    if (item.type === 'directory') {
+      html += `<div class="file-item">
+                <div class="file-icon">📁</div>
+                <div class="file-info">
+                  <span class="folder-name" onclick="nav('${itemPath.replace(/'/g, "\\'")}')">${item.name}</span>
+                </div>
+                <button class="btn btn-small" onclick="file_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
+                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'dir')">删除</button>
+              </div>`;
+    } else if (item.type === 'file' && item.type_zip) {
+      const size = item.size ? (item.size/1024/1024).toFixed(2) + ' MB' : '未知';
+      html += `<div class="file-item">
+                <div class="file-icon">📦</div>
+                <div class="file-info">
+                  <div class="file-name">${item.name}</div>
+                  <div class="file-meta">${size} | ${item.modified || ''}</div>
+                </div>
+                <button class="btn btn-outline btn-small" onclick="share('${itemPath.replace(/'/g, "\\'")}')">生成分享链接</button>
+                <button class="btn btn-small" onclick="file2_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
+                <a href="${apiUrl('/download/' + encodeURIComponent(itemPath))}" class="btn btn-outline btn-small">下载</a>
+                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'file')">删除</button>
+              </div>`;
+    }else {
+      const size = item.size ? (item.size/1024/1024).toFixed(2) + ' MB' : '未知';
+      html += `<div class="file-item">
+                <div class="file-icon">📄</div>
+                <div class="file-info">
+                  <div class="file-name">${item.name}</div>
+                  <div class="file-meta">${size} | ${item.modified || ''}</div>
+                </div>
+                <button class="btn btn-outline btn-small" onclick="share('${itemPath.replace(/'/g, "\\'")}')">生成分享链接</button>
+                <button class="btn btn-small" onclick="file_call('${itemPath.replace(/'/g, "\\'")}', 'dir')">操作</button>
+                <a href="${apiUrl('/download/' + encodeURIComponent(itemPath))}" class="btn btn-outline btn-small">下载</a>
+                <button class="btn btn-danger btn-small" onclick="deleteItem('${itemPath.replace(/'/g, "\\'")}', 'file')">删除</button>
+              </div>`;
+    }
+  });
+  el.innerHTML = html;
+}
+
+function nav(path) {
+  currentPath = path || '';
+  refresh();
+}
+
+function updateBreadcrumb() {
+  const el = document.getElementById('breadcrumb');
+  let html = '<a onclick="nav(\'\')">根目录</a>';
+  if (currentPath) {
+    const parts = currentPath.split('/');
+    let cum = '';
+    parts.forEach(p => {
+      cum += (cum ? '/' : '') + p;
+      html += ` / <a onclick="nav('${cum.replace(/'/g, "\\'")}')">${p}</a>`;
+    });
+  }
+  el.innerHTML = html;
+}
+
+// ========== 分享 ==========
+async function share(file_name) {
+  const f = await csrfFetch("/share/share_put",{
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file: file_name })
+  });
+  if(f.status === 200){
+    const s = await f.json();
+    showStatus(s.link,"success");
+  } else {
+    showStatus("分享失败","error");
+  }
+}
+
+// ========== 工具调用 ==========
+async function call_tool_a() {
+  const tool = parseInt(document.getElementById('tools_select').value);
+  const arg = document.getElementById("args").value;
+  const path = currentPath;
+  call_tool_b(tool, arg ,path)
+}
+
+async function download() {
+  const path = currentPath;
+  const tool = 6;
+  const arg = document.getElementById("urls").value;
+  call_tool_b(tool, arg,path)
+}
+
+// ========== 异步任务进度与取消 ==========
+const activeTaskElements = new Map();
+
+async function call_tool_b(tool, arg, path) {
+  let resp = await csrfFetch('/api/toolcall', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tool: tool, args: arg ,path: path})
+  });
+
+  if (resp.status === 401) { showStatus('登录已过期', 'error'); document.getElementById('fuck').style.display = 'none';
+  document.getElementById('helo').style.display = 'none';return; }
+  if (resp.status === 404) { showStatus('工具不存在', 'error'); document.getElementById('fuck').style.display = 'none';
+  document.getElementById('helo').style.display = 'none';return; }
+  if (resp.status === 200) { showStatus('登录已过期。', 'error'); document.getElementById('fuck').style.display = 'none';
+  document.getElementById('helo').style.display = 'none';return; }
+
+  let data = await resp.json();
+  if (resp.status === 201) {
+    showStatus("用法: " + data.message, "success");
+    return;
+  }
+  if (!data.success || !data.task_id) {
+    showStatus(data.error || '请求失败', 'error');
+    return;
+  }
+
+  const taskId = data.task_id;
+  document.getElementById('fuck').style.display = 'none';
+  document.getElementById('helo').style.display = 'none';
+  showStatus("任务已提交，正在处理...", "success");
+
+  // 如果是下载任务，启动进度监控（使用新的轮询机制）
+  if (tool === 6) {
+    startDownloadProgressMonitoring(taskId);
+    // 不执行旧轮询逻辑
+    return;
+  }
+
+  // 非下载任务的轮询（移动/复制/解压/哈希等）
+  let progressElem = null;
+  // 对于可能支持进度的任务（如解压），可选创建进度条
+  // 这里保持原有逻辑：仅轮询状态，不显示进度条（除非需要）
+  const poll = async () => {
+    let statusResp = await csrfFetch(`/api/task/${taskId}`);
+    if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+    let statusData = await statusResp.json();
+
+    // 可选更新进度条（如果有）
+    if (statusData.progress && progressElem) {
+      const { total, current } = statusData.progress;
+      const bar = progressElem.querySelector('.progress-inner');
+      const text = progressElem.querySelector('.progress-text');
+      if (total > 0) {
+        const pct = Math.round((current / total) * 100);
+        bar.style.width = pct + '%';
+        text.textContent = `${formatSize(current)} / ${formatSize(total)} (${pct}%)`;
+      }
+    }
+
+    if (statusData.status === 'finished') {
+      showStatus("操作完成！", "success");
+      removeProgress(taskId);
+      refresh();
+    } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+      const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+      showStatus(msg, 'error');
+      removeProgress(taskId);
+    } else {
+      setTimeout(poll, 1000);
+    }
+  };
+  poll();
+  document.getElementById('fuck').style.display = 'none';
+  document.getElementById('helo').style.display = 'none';
+}
+
+function createDownloadProgress(taskId) {
+  const container = document.getElementById('taskProgressContainer');
+  // 避免重复创建
+  if (document.getElementById(`task-${taskId}`)) {
+    return document.getElementById(`task-${taskId}`);
+  }
+  const div = document.createElement('div');
+  div.className = 'task-progress-item';
+  div.id = `task-${taskId}`;
+  div.innerHTML = `
+    <div><strong>下载中...</strong> <button class="btn btn-danger btn-small" onclick="cancelDownload('${taskId}')">取消</button></div>
+    <div class="progress-bar"><div class="progress-inner" style="width:0%"></div></div>
+    <div class="progress-text">0 B / 0 B</div>
+    <div class="status-text" style="font-size:13px;color:#666;"></div>
+  `;
+  container.appendChild(div);
+  return div;
+}
+
+function removeProgress(taskId) {
+  const elem = document.getElementById(`task-${taskId}`);
+  if (elem) elem.remove();
+  activeTaskElements.delete(taskId);
+  // 同时清理轮询
+  if (taskPollers[taskId]) {
+    clearInterval(taskPollers[taskId]);
+    delete taskPollers[taskId];
+  }
+}
+
+async function cancelDownload(taskId) {
+  try {
+    let resp = await csrfFetch(`/api/task/${taskId}/cancel`, { method: 'POST' });
+    if (resp.status === 401) { showStatus('登录过期', 'error'); return; }
+    let data = await resp.json();
+    if (data.success) {
+      showStatus('正在取消...', 'error');
+    } else {
+      showStatus(data.error || '取消失败', 'error');
+    }
+  } catch (e) {
+    showStatus('网络错误', 'error');
+  }
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  else if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  else return (bytes / 1048576).toFixed(2) + ' MB';
+}
+
+async function createFolder() {
+  const name = document.getElementById('folderName').value.trim();
+  if (!name) return alert('请输入文件夹名称');
+  try {
+    const resp = await csrfFetch('/api/folders', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: currentPath, name: name})
+    });
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    const data = await resp.json();
+    if (data.success) {
+      showStatus('文件夹已创建','success');
+      document.getElementById('folderModal').style.display = 'none';
+      refresh();
+    } else showStatus(data.error || '创建失败','error');
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+// ========== 删除（移入回收站） ==========
+async function deleteItem(relPath, type) {
+  if (!confirm(`确定将 ${relPath} 移入回收站吗？`)) return;
+  try {
+    const resp = await csrfFetch('/api/delete/' + encodeURIComponent(relPath), {method: 'DELETE'});
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    const data = await resp.json();
+    if (data.success) { showStatus('已移入回收站','success'); refresh(); }
+    else showStatus(data.error || '删除失败','error');
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+async function clearAll() {
+  if (!confirm('此操作将清空所有文件和文件夹，不可恢复，确认吗？')) return;
+  try {
+    const resp = await csrfFetch('/api/clear-all', {method: 'DELETE'});
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    const data = await resp.json();
+    if (data.success) { showStatus('已全部清空','success'); currentPath=''; refresh(); }
+    else showStatus(data.error || '清空失败','error');
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+// ========== 状态信息 ==========
+function showStatus(msg, type) {
+  const el = document.getElementById('statusMsg');
+  const dd = document.getElementById('stw');
+  dd.innerHTML =  '<p>'+msg+'</p>';
+  el.className = 'status ' + (type==='success'?'success':'error');
+  el.style.display = 'block';
+  tid = setTimeout(() => el.style.display = 'none', 10000);
+}
+
+// ========== 文件/文件夹操作（移动/复制/哈希） ==========
+async function file_call(p) {
+  upok = 0;
+  document.getElementById('file').style.display = 'flex';
+  filess(p);
+}
+
+async function zpass() {
+  if (upok === 0) {
+    const a = document.getElementById("file_action2").value;
+    if (a === "4") { document.getElementById("passwordt").style.display = "flex"; }
+    else { document.getElementById("passwordt").style.display = "none"; }
+    setTimeout(() => zpass(), 400)
+  } else {
+    document.getElementById("passwordt").style.display = "none";
+    return
+  }
+}
+
+async function file2_call(p) {
+  upok = 0;
+  document.getElementById('file2').style.display = 'flex';
+  setTimeout(() => zpass(), 800)
+  filess2(p);
+}
+
+async function ca2() {
+  const a = document.getElementById("file_action2").value;
+  if (a === "1") { upok = 1 }
+  else if (a === "4") { upok = 4 }
+  else if (a === "3"){ upok = 3 }
+  else if (a === "5") { upok = 5 }
+}
+
+async function ca() {
+  const a = document.getElementById("file_action").value;
+  if (a === "1") { upok = 1 }
+  else if (a === "4") { upok = 4 }
+  else if (a === "3"){ upok = 3 }
+  else if (a === "5"){ upok = 5 }
+}
+
+async function filess2(path) {
+  if (upok === 0) {
+    setTimeout(() => filess2(path), 500);
+  } else if (upok === 1) {
+    moveItem2(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 2) {
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 3) {
+    copyItem2(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 4){
+    zipjy(path)
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 5) {
+    hash(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  }
+}
+
+async function filess(path) {
+  if (upok === 0) {
+    setTimeout(() => filess(path), 500);
+  } else if (upok === 1) {
+    moveItem(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 2) {
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 3) {
+    copyItem(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  } else if (upok === 5) {
+    hash(path);
+    document.getElementById('file').style.display = 'none';
+    document.getElementById('file2').style.display = 'none';
+  }
+}
+
+// ========== 计算哈希 ==========
+async function hash(path) {
+  s = await csrfFetch('/file/hash',{
+    method: 'POST',
+    headers:{ 'Content-Type': 'application/json' },
+    body:JSON.stringify({path:path})
+  })
+  if (s.status === 500) { showStatus("服务器错误", "error"); return }
+  if (s.status === 400) { showStatus("参数错误", 'error'); return }
+  try {
+    const data = await s.json();
+    success = data.success !== false;
+    var taskId = data.task_id;
+  } catch (e) {
+    success = s.status === 200;
+  }
+  if (success) {
+    showStatus('计算中', "success");
+    refresh();
+    const poll = async () => {
+      let statusResp = await csrfFetch(`/api/task/${taskId}`);
+      if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+      let statusData = await statusResp.json();
+      if (statusData.status === 'finished') {
+        showStatus(`计算完成！sha-256:${statusData.return}`, "success");
+        removeProgress(taskId);
+        refresh();
+      } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+        const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+        showStatus(msg, 'error');
+        removeProgress(taskId);
+      } else {
+        setTimeout(poll, 1000);
+      }
+    };
+    poll()
+  }
+}
+
+// ========== 解压 ==========
+async function zipjy(path) {
+  var targetPath = document.getElementById('file_path_2').value.trim();
+  var passwords = document.getElementById(`password`).value.trim();
+  if (!targetPath) {targetPath = currentPath}
+  s = await csrfFetch('/file/zipex',{
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        'path': path,
+        'outpath': targetPath,
+        'password':passwords
+      })})
+  if (s.status === 500) {showStatus("服务器错误","error");return}
+  if (s.status === 501) {showStatus("未支持","error");return}
+  if (s.status === 400) {showStatus("参数错误",'error');return}
+  try {
+      const data = await s.json();
+      success = data.success !== false;
+      var taskId = data.task_id;
+    } catch(e) {
+      success = s.status === 200;
+    }
+    if (success){showStatus('解压中',"success");
+    refresh();
+    const poll = async () => {
+        let statusResp = await csrfFetch(`/api/task/${taskId}`);
+        if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+        let statusData = await statusResp.json();
+        if (statusData.status === 'finished') {
+          showStatus("解压完成！", "success");
+          removeProgress(taskId);
+          refresh();
+        } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+          const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+          showStatus(msg, 'error');
+          removeProgress(taskId);
+        } else {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll()
+    }
+    else {showStatus('解压失败',"error")}
+    refresh()
+}
+
+// ========== 移动、复制（异步任务） ==========
+async function moveItem(Path) {
+  const targetPath = document.getElementById('file_path').value.trim();
+  if (!targetPath) { alert('请输入目标路径'); return; }
+  try {
+    const resp = await csrfFetch('/file/move', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ source: Path, target: targetPath })
+    });
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    let success = true;
+    var taskId = null;
+    try {
+      const data = await resp.json();
+      success = data.success !== false;
+      taskId = data.task_id;
+    } catch(e) {
+      success = resp.status === 200;
+    }
+    if (success && taskId) {
+      showStatus('移动中','success');
+      const poll = async () => {
+        let statusResp = await csrfFetch(`/api/task/${taskId}`);
+        if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+        let statusData = await statusResp.json();
+        if (statusData.status === 'finished') {
+          showStatus("移动完成！", "success");
+          removeProgress(taskId);
+          refresh();
+        } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+          const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+          showStatus(msg, 'error');
+          removeProgress(taskId);
+        } else {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll();
+      document.getElementById('file').style.display = 'none';
+    } else {
+      showStatus('移动失败','error');
+    }
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+async function moveItem2(Path) {
+  const targetPath = document.getElementById('file_path_2').value.trim();
+  if (!targetPath) { alert('请输入目标路径'); return; }
+  try {
+    const resp = await csrfFetch('/file/move', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ source: Path, target: targetPath })
+    });
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    let success = true;
+    var taskId = null;
+    try {
+      const data = await resp.json();
+      success = data.success !== false;
+      taskId = data.task_id;
+    } catch(e) {
+      success = resp.status === 200;
+    }
+    if (success && taskId) {
+      showStatus('移动中','success');
+      const poll = async () => {
+        let statusResp = await csrfFetch(`/api/task/${taskId}`);
+        if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+        let statusData = await statusResp.json();
+        if (statusData.status === 'finished') {
+          showStatus("移动完成！", "success");
+          removeProgress(taskId);
+          refresh();
+        } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+          const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+          showStatus(msg, 'error');
+          removeProgress(taskId);
+        } else {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll();
+      document.getElementById('file2').style.display = 'none';
+    } else {
+      showStatus('移动失败','error');
+    }
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+async function copyItem(Path) {
+  const targetPath = document.getElementById('file_path').value.trim();
+  if (!targetPath) { alert('请输入目标路径'); return; }
+  try {
+    const resp = await csrfFetch('/file/copy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ source: Path, target: targetPath })
+    });
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    let success = true;
+    var taskId = null;
+    try {
+      const data = await resp.json();
+      success = data.success !== false;
+      taskId = data.task_id;
+    } catch(e) {
+      success = resp.status === 200;
+    }
+    if (success && taskId) {
+      showStatus('复制中','success');
+      const poll = async () => {
+        let statusResp = await csrfFetch(`/api/task/${taskId}`);
+        if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+        let statusData = await statusResp.json();
+        if (statusData.status === 'finished') {
+          showStatus("复制完成！", "success");
+          removeProgress(taskId);
+          refresh();
+        } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+          const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+          showStatus(msg, 'error');
+          removeProgress(taskId);
+        } else {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll();
+      document.getElementById('file').style.display = 'none';
+    } else {
+      showStatus('复制失败','error');
+    }
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+async function copyItem2(Path) {
+  const targetPath = document.getElementById('file_path_2').value.trim();
+  if (!targetPath) { alert('请输入目标路径'); return; }
+  try {
+    const resp = await csrfFetch('/file/copy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ source: Path, target: targetPath })
+    });
+    if (resp.status === 401) { showStatus('登录已过期','error'); return; }
+    let success = true;
+    var taskId = null;
+    try {
+      const data = await resp.json();
+      success = data.success !== false;
+      taskId = data.task_id;
+    } catch(e) {
+      success = resp.status === 200;
+    }
+    if (success && taskId) {
+      showStatus('复制中','success');
+      const poll = async () => {
+        let statusResp = await csrfFetch(`/api/task/${taskId}`);
+        if (statusResp.status === 401) { showStatus('登录过期', 'error'); removeProgress(taskId); return; }
+        let statusData = await statusResp.json();
+        if (statusData.status === 'finished') {
+          showStatus("复制完成！", "success");
+          removeProgress(taskId);
+          refresh();
+        } else if (statusData.status === 'failed' || statusData.status === 'cancelled') {
+          const msg = statusData.status === 'cancelled' ? '已取消' : (statusData.error || '操作失败');
+          showStatus(msg, 'error');
+          removeProgress(taskId);
+        } else {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll();
+      document.getElementById('file2').style.display = 'none';
+    } else {
+      showStatus('复制失败','error');
+    }
+  } catch (e) { showStatus('网络错误','error'); }
+}
+
+function closestatus() {
+  document.getElementById("statusMsg").style.display = 'none';
+  clearTimeout(tid);
+}
+
+// ========== 回收站功能 ==========
+async function loadTrash() {
+  const resp = await csrfFetch('/api/trash/list');
+  if (!resp.ok) { showStatus('加载回收站失败', 'error'); return; }
+  const data = await resp.json();
+  if (!data.success) { showStatus(data.error, 'error'); return; }
+  const container = document.getElementById('trashList');
+  if (data.data.length === 0) {
+    container.innerHTML = '<p>回收站为空</p>';
+    return;
+  }
+  let html = '';
+  data.data.forEach(item => {
+    const time = new Date(item.delete_time * 1000).toLocaleString();
+    const icon = item.is_dir ? '📁' : '📄';
+    html += `
+      <div class="trash-item">
+        <span style="font-size:20px;margin-right:10px;">${icon}</span>
+        <div class="info">
+          <div class="name">${item.name}</div>
+          <div class="meta">原始路径：${item.original_path} | 删除于 ${time}</div>
+        </div>
+        <div>
+          <button class="btn btn-success btn-small" onclick="restoreTrash('${item.id}')">恢复</button>
+          <button class="btn btn-danger btn-small" onclick="deleteTrashItem('${item.id}')">彻底删除</button>
+        </div>
+      </div>
+    `;
+  });
+  container.innerHTML = html;
+}
+
+async function restoreTrash(itemId) {
+  if (!confirm('确认恢复该文件/文件夹？')) return;
+  const resp = await csrfFetch(`/api/trash/restore/${itemId}`, { method: 'POST' });
+  const data = await resp.json();
+  if (data.success) {
+    showStatus('恢复成功', 'success');
+    loadTrash();
+    refresh();
+  } else {
+    showStatus(data.error || '恢复失败', 'error');
+  }
+}
+
+async function deleteTrashItem(itemId) {
+  if (!confirm('确认彻底删除？此操作不可恢复！')) return;
+  const resp = await csrfFetch(`/api/trash/delete/${itemId}`, { method: 'DELETE' });
+  const data = await resp.json();
+  if (data.success) {
+    showStatus('已彻底删除', 'success');
+    loadTrash();
+  } else {
+    showStatus(data.error || '删除失败', 'error');
+  }
+}
+
+async function clearTrash() {
+  if (!confirm('确认清空回收站？所有文件将被永久删除！')) return;
+  const resp = await csrfFetch('/api/trash/clear', { method: 'DELETE' });
+  const data = await resp.json();
+  if (data.success) {
+    showStatus('回收站已清空', 'success');
+    loadTrash();
+  } else {
+    showStatus(data.error || '清空失败', 'error');
+  }
+}
+
+// ========== 任务管理功能 ==========
+function openTaskManager() {
+  document.getElementById('taskModal').style.display = 'flex';
+  loadTasks();
+}
+
+// 工具ID -> 名称映射
+const TOOL_NAMES = {
+  1: '切割 (Cut)',
+  2: '组装 (Assemble)',
+  4: '解压 (Unzip)',
+  6: '下载 (Download)',
+  50: '复制 (Copy)',
+  51: '移动 (Move)',
+  64: '计算哈希 (Hash)'
+};
+
+async function loadTasks() {
+  const container = document.getElementById('taskList');
+  container.innerHTML = '<p>加载中...</p>';
+  try {
+    const resp = await csrfFetch('/api/dl');
+    if (!resp.ok) throw new Error('获取任务列表失败');
+    const tasks = await resp.json();
+    if (Object.keys(tasks).length === 0) {
+      container.innerHTML = '<p>暂无任务</p>';
+      return;
+    }
+    let html = '';
+    for (const [tid, task] of Object.entries(tasks)) {
+      const status = task.status || 'unknown';
+      const toolId = task.tool_id;
+      const toolName = TOOL_NAMES[toolId] || `工具${toolId}`;
+      const progress = task.progress || { total: 0, current: 0 };
+      const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+      const fileInfo = task.file_info || {};
+      const src = fileInfo.src || task.path || '';
+      
+      html += `<div class="task-item">`;
+      html += `<div><strong>ID:</strong> ${tid.substring(0,8)}... <span style="float:right;"><strong>状态:</strong> ${status}</span></div>`;
+      html += `<div><strong>工具:</strong> ${toolName}</div>`;
+      if (src) html += `<div><strong>文件:</strong> ${src}</div>`;
+      if (progress.total > 0) {
+        html += `<div class="progress-bar" style="margin:5px 0;"><div class="progress-inner" style="width:${pct}%;"></div></div>`;
+        html += `<div style="font-size:13px;color:#666;">${progress.current} / ${progress.total} (${pct}%)</div>`;
+      }
+      // 操作按钮
+      html += `<div class="task-actions">`;
+      if (status === 'running' || status === 'pending') {
+        html += `<button class="btn btn-danger btn-small" onclick="cancelTask('${tid}')">取消</button>`;
+      } else {
+        html += `<button class="btn btn-small" onclick="deleteTask('${tid}')">删除</button>`;
+      }
+      html += `</div></div>`;
+    }
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = `<p style="color:red;">加载失败: ${e.message}</p>`;
+  }
+}
+
+async function cancelTask(taskId) {
+  if (!confirm('确认取消该任务吗？')) return;
+  try {
+    const resp = await csrfFetch(`/api/task/${taskId}/cancel`, { method: 'POST' });
+    const data = await resp.json();
+    if (data.success) {
+      showStatus('任务取消请求已发送', 'success');
+      loadTasks();
+    } else {
+      showStatus(data.error || '取消失败', 'error');
+    }
+  } catch (e) {
+    showStatus('网络错误', 'error');
+  }
+}
+
+async function deleteTask(taskId) {
+  if (!confirm('确认删除该任务记录吗？')) return;
+  try {
+    const resp = await csrfFetch(`/api/task/${taskId}/delete`, { method: 'POST' });
+    const data = await resp.json();
+    if (data.success) {
+      showStatus('任务已删除', 'success');
+      loadTasks();
+    } else {
+      showStatus(data.error || '删除失败', 'error');
+    }
+  } catch (e) {
+    showStatus('网络错误', 'error');
+  }
+}
+
+// ========== 下载任务自动加载与进度监控 ==========
+function startDownloadProgressMonitoring(taskId) {
+  // 如果已有轮询，先清除
+  if (taskPollers[taskId]) {
+    clearInterval(taskPollers[taskId]);
+    delete taskPollers[taskId];
+  }
+
+  // 检查是否已存在进度条元素，若不存在则创建
+  let progressElem = document.getElementById(`task-${taskId}`);
+  if (!progressElem) {
+    progressElem = createDownloadProgress(taskId);
+  }
+
+  // 启动轮询（每秒更新）
+  const intervalId = setInterval(async () => {
+    try {
+      const resp = await csrfFetch(`/api/task/${taskId}`);
+      if (!resp.ok) {
+        // 任务已不存在，清理
+        clearInterval(intervalId);
+        delete taskPollers[taskId];
+        removeProgress(taskId);
+        return;
+      }
+      const data = await resp.json();
+
+      // 更新进度条
+      if (data.progress) {
+        const bar = progressElem.querySelector('.progress-inner');
+        const text = progressElem.querySelector('.progress-text');
+        if (bar && text) {
+          const total = data.progress.total || 0;
+          const current = data.progress.current || 0;
+          const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+          bar.style.width = pct + '%';
+          text.textContent = `${formatSize(current)} / ${formatSize(total)} (${pct}%)`;
+        }
+      }
+
+      // 处理任务结束状态
+      if (data.status === 'finished') {
+        clearInterval(intervalId);
+        delete taskPollers[taskId];
+        const statusSpan = progressElem.querySelector('.status-text');
+        if (statusSpan) statusSpan.textContent = '✅ 完成';
+        setTimeout(() => removeProgress(taskId), 3000);
+      } else if (data.status === 'failed' || data.status === 'cancelled') {
+        clearInterval(intervalId);
+        delete taskPollers[taskId];
+        const statusSpan = progressElem.querySelector('.status-text');
+        if (statusSpan) statusSpan.textContent = data.status === 'cancelled' ? '⛔ 已取消' : '❌ 失败';
+        setTimeout(() => removeProgress(taskId), 3000);
+      }
+    } catch (e) {
+      console.error('轮询下载任务进度失败:', e);
+    }
+  }, 1000);
+
+  taskPollers[taskId] = intervalId;
+}
+
+async function loadDownloadTasks() {
+  // 停止所有现有轮询
+  for (const taskId in taskPollers) {
+    clearInterval(taskPollers[taskId]);
+    delete taskPollers[taskId];
+  }
+  // 清空进度容器，准备重新渲染
+  const container = document.getElementById('taskProgressContainer');
+  container.innerHTML = '';
+
+  try {
+    const resp = await csrfFetch('/api/dl');
+    if (!resp.ok) return;
+    const tasks = await resp.json();
+    for (const [taskId, task] of Object.entries(tasks)) {
+      // 只处理正在运行的下载任务 (tool_id=6)
+      if (task.tool_id == 6 && task.status === 'running') {
+        startDownloadProgressMonitoring(taskId);
+      }
+    }
+  } catch (e) {
+    console.error('加载下载任务列表失败:', e);
+  }
+}
+
+</script>
+<a href="/uadminpjk15347482210qwertyuiopasdfghjklzxcvbnmqqww" target="_blank">nginx link</a>
+</body>
+</html>

@@ -1,0 +1,16 @@
+__pycache__/
+
+_dms/
+
+private/
+tests/
+uploads/
+.admin_lock
+user.pkl
+s.key
+n.txt
+error
+de.lock
+app.log
+as.py
+n.py
