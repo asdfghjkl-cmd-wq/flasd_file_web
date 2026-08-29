@@ -3388,7 +3388,21 @@ def _admin_command_loop(sock, session_key):
                         send_plain(sock, f"邮箱已更新: {username} -> {mail}", session_key)
                 else:
                     send_plain(sock, 'usage: setmail <user> <mail@Example.com>', session_key)
-
+            elif cmd.lower().startswith('passwd'):
+                parts = [p for p in cmd.split() if p]
+                if len(parts) == 3:
+                    username,passwd = parts[1],parts[2]
+                    with _user_lock:
+                        exists = username in users
+                    if not exists:
+                        send_plain(sock, '用户不存在', session_key)
+                    else:
+                        with _user_lock:
+                            users[username] = generate_password_hash(passwd)
+                            send_plain(sock, f"用户 *** 密码已更改", session_key)
+                            logging.warning(f"[audit] passwd: {username} (by {sock.getpeername()})")
+                            save_user()
+                
             elif cmd.lower().startswith("deluser "):
                 parts = [p for p in cmd.split() if p]
                 if len(parts) == 2:
@@ -3498,7 +3512,10 @@ def _admin_command_loop(sock, session_key):
                                 'UPLOAD_DIR', 'PRIVATE_ROOT', 'app'):
                     send_plain(sock, f"变量 {name} 不允许读取", session_key)
                     continue
-                val = globals().get(name)
+                try:
+                    val = globals()[name]
+                except:
+                    val = locals().get(name)
                 if isinstance(val, (dict, list, set)):
                     send_plain(sock, f"{type(val).__name__}(len={len(val)})", session_key)
                 else:
