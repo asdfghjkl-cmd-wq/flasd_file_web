@@ -522,11 +522,11 @@ def _start_admin_server():
         logging.error("ADMIN_PORT_MAX(%s) < ADMIN_PORT_MIN(%s),放弃启动管理控制台", max_p, min_p)
         return None
     port = None
-    for _ in range(50):   # 随机尝试有限次数,防止范围内端口全被占用时无限循环
-        sm = secrets.randbelow(max_p - min_p + 1) + min_p
-        if not is_port_in_use(sm):
-            port = sm
+    for ax in range(min_p,max_p):
+        if not is_port_in_use(ax):
+            port = ax
             break
+
     if port is None:
         logging.error("管理端口范围 %s-%s 全部被占用,放弃启动管理控制台", min_p, max_p)
         try:
